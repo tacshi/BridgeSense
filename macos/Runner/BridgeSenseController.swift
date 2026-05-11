@@ -12,7 +12,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   private let settingsKey = "BridgeSenseSettingsV1"
   private let enabledKey = "BridgeSenseEnabledV1"
   private let buttonThreshold = 0.55
-  private let accessibilityRefreshInterval = 0.25
+  private let accessibilityRefreshInterval = 1.0
 
   private var methodChannel: FlutterMethodChannel?
   private var eventChannel: FlutterEventChannel?
@@ -68,7 +68,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     eventSink events: @escaping FlutterEventSink
   ) -> FlutterError? {
     eventSink = events
-    refreshAccessibilityTrust()
+    refreshAccessibilityTrust(emitOnChange: false)
     emitSnapshot(force: true)
     return nil
   }
@@ -209,6 +209,18 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
         perform(mapping: mapping)
       }
       previousPressed[mapping.id] = pressed
+    }
+  }
+
+  private func syncPreviousPressedWithCurrentInputs() {
+    guard currentController?.extendedGamepad != nil else {
+      previousPressed.removeAll()
+      return
+    }
+
+    inputValues = readInputs()
+    for mapping in mappings where !isContinuousMapping(mapping.id) {
+      previousPressed[mapping.id] = (inputValues[mapping.id] ?? 0) >= buttonThreshold
     }
   }
 
@@ -640,7 +652,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       emitSnapshot(force: true)
       result(snapshot())
     case "requestAccessibility":
-      let trusted = refreshAccessibilityTrust(prompt: true, forceEmit: true)
+      let trusted = refreshAccessibilityTrust(prompt: true, emitOnChange: false)
       lastAction = trusted ? "Accessibility trusted" : "Accessibility requested"
       emitSnapshot(force: true)
       result(["trusted": trusted])
@@ -770,22 +782,23 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   @discardableResult
-  private func refreshAccessibilityTrust(prompt: Bool = false, forceEmit: Bool = false) -> Bool {
+  private func refreshAccessibilityTrust(prompt: Bool = false, emitOnChange: Bool = true) -> Bool {
     let trusted = readAccessibilityTrusted(prompt: prompt)
     guard trusted != accessibilityTrustedState else {
-      if forceEmit {
-        emitSnapshot(force: true)
-      }
       return trusted
     }
 
     accessibilityTrustedState = trusted
-    previousPressed.removeAll()
-    if !trusted {
+    if trusted {
+      syncPreviousPressedWithCurrentInputs()
+    } else {
+      previousPressed.removeAll()
       resetAdaptiveTriggers()
     }
     lastAction = trusted ? "Accessibility trusted" : "Accessibility revoked"
-    emitSnapshot(force: true)
+    if emitOnChange {
+      emitSnapshot(force: true)
+    }
     return trusted
   }
 

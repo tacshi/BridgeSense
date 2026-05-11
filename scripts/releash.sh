@@ -34,7 +34,7 @@ Alternate notarization credentials:
 Optional:
   APP_DISPLAY_NAME          Defaults to BridgeSense.
   PRODUCT_NAME              Defaults to bridge_sense.
-  DMG_PATH                  Defaults to ./BridgeSense-\$VERSION.dmg.
+  DMG_PATH                  Defaults to ./\$APP_DISPLAY_NAME-\$VERSION.dmg.
   GITHUB_RELEASE_TAG        Defaults to v\$VERSION.
   GITHUB_RELEASE_TITLE      Defaults to "\$APP_DISPLAY_NAME \$VERSION".
   GITHUB_RELEASE_NOTES      Defaults to "\$APP_DISPLAY_NAME \$VERSION".

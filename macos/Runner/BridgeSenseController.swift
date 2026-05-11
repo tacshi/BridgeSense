@@ -830,7 +830,12 @@ private final class RawDualSenseTouchpadReader {
 
   private var manager: IOHIDManager?
   private var devices: [String: DeviceRegistration] = [:]
-  private var pollTimer: Timer?
+  private let devicesLock = NSLock()
+  private let pollQueue = DispatchQueue(
+    label: "BridgeSense.RawDualSenseTouchpadReader.poll",
+    qos: .userInitiated
+  )
+  private var pollTimer: DispatchSourceTimer?
 
   deinit {
     stop()
@@ -863,7 +868,16 @@ private final class RawDualSenseTouchpadReader {
       CFRunLoopGetMain(),
       CFRunLoopMode.commonModes.rawValue
     )
-    IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    guard openResult == kIOReturnSuccess else {
+      NSLog("BridgeSense: failed to open DualSense HID manager: 0x%08x", openResult)
+      IOHIDManagerUnscheduleFromRunLoop(
+        manager,
+        CFRunLoopGetMain(),
+        CFRunLoopMode.commonModes.rawValue
+      )
+      return
+    }
 
     self.manager = manager
 
@@ -872,12 +886,6 @@ private final class RawDualSenseTouchpadReader {
         register(device: device)
       }
     }
-
-    pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120.0, repeats: true) {
-      [weak self] _ in
-      self?.pollFullReports()
-    }
-    RunLoop.main.add(pollTimer!, forMode: .common)
   }
 
   func stop() {
@@ -885,10 +893,14 @@ private final class RawDualSenseTouchpadReader {
       return
     }
 
-    pollTimer?.invalidate()
-    pollTimer = nil
+    stopPolling()
 
-    for registration in devices.values {
+    devicesLock.lock()
+    let registrations = Array(devices.values)
+    devices.removeAll()
+    devicesLock.unlock()
+
+    for registration in registrations {
       IOHIDDeviceRegisterInputReportCallback(
         registration.device,
         registration.reportBuffer,
@@ -903,7 +915,6 @@ private final class RawDualSenseTouchpadReader {
       )
       registration.reportBuffer.deallocate()
     }
-    devices.removeAll()
 
     IOHIDManagerUnscheduleFromRunLoop(
       manager,
@@ -920,19 +931,27 @@ private final class RawDualSenseTouchpadReader {
     }
 
     let key = deviceKey(device)
-    guard devices[key] == nil else {
-      return
-    }
-
     let reportLength = max(inputReportLength(for: device), 128)
     let reportBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: reportLength)
     reportBuffer.initialize(repeating: 0, count: reportLength)
 
-    devices[key] = DeviceRegistration(
+    let registration = DeviceRegistration(
       device: device,
       reportBuffer: reportBuffer,
       reportLength: reportLength
     )
+
+    devicesLock.lock()
+    if devices[key] == nil {
+      devices[key] = registration
+      devicesLock.unlock()
+    } else {
+      devicesLock.unlock()
+      reportBuffer.deallocate()
+      return
+    }
+
+    startPollingIfNeeded()
 
     IOHIDDeviceRegisterInputReportCallback(
       device,
@@ -950,7 +969,12 @@ private final class RawDualSenseTouchpadReader {
 
   private func remove(device: IOHIDDevice) {
     let key = deviceKey(device)
-    guard let registration = devices.removeValue(forKey: key) else {
+    devicesLock.lock()
+    let registration = devices.removeValue(forKey: key)
+    let isEmpty = devices.isEmpty
+    devicesLock.unlock()
+
+    guard let registration else {
       return
     }
 
@@ -967,6 +991,9 @@ private final class RawDualSenseTouchpadReader {
       CFRunLoopMode.commonModes.rawValue
     )
     registration.reportBuffer.deallocate()
+    if isEmpty {
+      stopPolling()
+    }
   }
 
   private func handle(reportID: UInt32, report: UnsafeMutablePointer<UInt8>, length: Int) {
@@ -980,7 +1007,15 @@ private final class RawDualSenseTouchpadReader {
   }
 
   private func pollFullReports() {
-    for registration in devices.values {
+    let registrations = registeredDevices()
+    guard !registrations.isEmpty else {
+      DispatchQueue.main.async { [weak self] in
+        self?.stopPolling()
+      }
+      return
+    }
+
+    for registration in registrations {
       if let sample = copyFullReportSample(
         device: registration.device,
         reportID: 0x31,
@@ -990,9 +1025,49 @@ private final class RawDualSenseTouchpadReader {
         reportID: 0x01,
         length: registration.reportLength
       ) {
-        onSample?(sample)
+        DispatchQueue.main.async { [weak self] in
+          self?.onSample?(sample)
+        }
       }
     }
+  }
+
+  private func registeredDevices() -> [DeviceRegistration] {
+    devicesLock.lock()
+    defer { devicesLock.unlock() }
+    return Array(devices.values)
+  }
+
+  private func startPollingIfNeeded() {
+    devicesLock.lock()
+    let shouldStart = !devices.isEmpty && pollTimer == nil
+    devicesLock.unlock()
+    guard shouldStart else {
+      return
+    }
+
+    let timer = DispatchSource.makeTimerSource(queue: pollQueue)
+    timer.schedule(deadline: .now(), repeating: 1.0 / 60.0)
+    timer.setEventHandler { [weak self] in
+      self?.pollFullReports()
+    }
+    devicesLock.lock()
+    if pollTimer == nil {
+      pollTimer = timer
+      devicesLock.unlock()
+      timer.resume()
+    } else {
+      devicesLock.unlock()
+      timer.cancel()
+    }
+  }
+
+  private func stopPolling() {
+    devicesLock.lock()
+    let timer = pollTimer
+    pollTimer = nil
+    devicesLock.unlock()
+    timer?.cancel()
   }
 
   private func copyFullReportSample(

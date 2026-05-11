@@ -35,6 +35,9 @@ Optional:
   APP_DISPLAY_NAME          Defaults to BridgeSense.
   PRODUCT_NAME              Defaults to bridge_sense.
   DMG_PATH                  Defaults to ./BridgeSense-\$VERSION.dmg.
+  GITHUB_RELEASE_TAG        Defaults to v\$VERSION.
+  GITHUB_RELEASE_TITLE      Defaults to "\$APP_DISPLAY_NAME \$VERSION".
+  GITHUB_RELEASE_NOTES      Defaults to "\$APP_DISPLAY_NAME \$VERSION".
 USAGE
 }
 
@@ -73,6 +76,25 @@ sign_code() {
   codesign --force --timestamp --options runtime --sign "$DEVELOPER_ID_APPLICATION" "$path"
 }
 
+publish_github_release() {
+  local tag="${GITHUB_RELEASE_TAG:-v$VERSION}"
+  local title="${GITHUB_RELEASE_TITLE:-$APP_DISPLAY_NAME $VERSION}"
+  local notes="${GITHUB_RELEASE_NOTES:-$APP_DISPLAY_NAME $VERSION}"
+  local target
+
+  target="$(git rev-parse HEAD)"
+
+  echo "Publishing GitHub Release $tag..."
+  if gh release view "$tag" >/dev/null 2>&1; then
+    gh release upload "$tag" "$DMG_PATH" --clobber
+  else
+    gh release create "$tag" "$DMG_PATH" \
+      --target "$target" \
+      --title "$title" \
+      --notes "$notes"
+  fi
+}
+
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && {
   usage
   exit 0
@@ -98,6 +120,8 @@ DMG_PATH="${DMG_PATH:-$ROOT_DIR/${APP_DISPLAY_NAME}-${VERSION}.dmg}"
 require_tool codesign
 require_tool ditto
 require_tool flutter
+require_tool gh
+require_tool git
 require_tool hdiutil
 require_tool xcrun
 xcrun -f notarytool >/dev/null
@@ -162,3 +186,4 @@ xcrun stapler validate "$DMG_PATH"
 spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"
 
 echo "Release DMG: $DMG_PATH"
+publish_github_release

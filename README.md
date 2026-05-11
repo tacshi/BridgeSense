@@ -54,7 +54,8 @@ flutter build macos --debug
 
 `scripts/releash.sh` builds a release macOS app, signs it with the
 `DEVELOPER_ID_APPLICATION` identity, creates a root-level DMG, notarizes it with
-Apple, staples the ticket, and validates Gatekeeper acceptance.
+Apple, staples the ticket, validates Gatekeeper acceptance, and uploads the DMG
+to GitHub Releases.
 
 The script uses the saved notarytool keychain profile `BridgeSense` by default.
 Create that profile outside the repo before releasing:
@@ -66,6 +67,12 @@ xcrun notarytool store-credentials BridgeSense \
   --password "<app-specific-password>"
 ```
 
+The GitHub CLI must be authenticated for this repo:
+
+```bash
+gh auth status
+```
+
 Run a release:
 
 ```bash
@@ -73,4 +80,5 @@ DEVELOPER_ID_APPLICATION="Developer ID Application: Example Name (TEAMID)" \
   ./scripts/releash.sh 1.0.1
 ```
 
-The output is written to the project root as `BridgeSense-<version>.dmg`.
+The output is written to the project root as `BridgeSense-<version>.dmg` and
+published to the `v<version>` GitHub Release.

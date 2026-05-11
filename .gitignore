@@ -129,3 +129,5 @@ $RECYCLE.BIN/
 # Local IDE files
 .idea/
 *.iml
+
+*.dmg

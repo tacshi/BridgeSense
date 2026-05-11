@@ -1,7 +1,9 @@
 # BridgeSense
 
 BridgeSense is a macOS Flutter utility that maps a DualSense or compatible
-extended game controller to desktop input.
+extended game controller to desktop input, including mouse movement, scrolling,
+keyboard shortcuts, mouse clicks, haptics, adaptive triggers, and menu bar
+background operation.
 
 ## Current bridge
 
@@ -14,6 +16,9 @@ extended game controller to desktop input.
 - Controller haptics are exposed as `Drive`, `Shoot`, and `Pulse` patterns.
 - DualSense adaptive triggers are used when macOS reports the controller as a
   `GCDualSenseGamepad`.
+- Closing the window keeps BridgeSense running from its menu bar status item.
+- The macOS app icon is generated from the checked-in app icon source at
+  `assets/app_icon/bridgesense_icon_1024.png`.
 
 ## Permissions
 
@@ -44,3 +49,28 @@ flutter analyze
 flutter test
 flutter build macos --debug
 ```
+
+## Release
+
+`scripts/releash.sh` builds a release macOS app, signs it with the
+`DEVELOPER_ID_APPLICATION` identity, creates a root-level DMG, notarizes it with
+Apple, staples the ticket, and validates Gatekeeper acceptance.
+
+The script uses the saved notarytool keychain profile `BridgeSense` by default.
+Create that profile outside the repo before releasing:
+
+```bash
+xcrun notarytool store-credentials BridgeSense \
+  --apple-id "<apple-id>" \
+  --team-id "<team-id>" \
+  --password "<app-specific-password>"
+```
+
+Run a release:
+
+```bash
+DEVELOPER_ID_APPLICATION="Developer ID Application: Example Name (TEAMID)" \
+  ./scripts/releash.sh
+```
+
+The output is written to the project root as `BridgeSense-<version>.dmg`.

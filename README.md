@@ -6,8 +6,7 @@
 
 BridgeSense is a macOS utility for using a DualSense controller as a desktop
 input device. It maps controller input to pointer movement, scrolling, keyboard
-shortcuts, mouse clicks, haptics, and DualSense adaptive triggers while staying
-available from the menu bar when the main window is closed.
+shortcuts, mouse clicks, haptics, and DualSense adaptive triggers.
 
 ## Features
 
@@ -19,7 +18,6 @@ available from the menu bar when the main window is closed.
   patterns.
 - DualSense adaptive trigger effects for vibration-enabled L2/R2 trigger
   bindings.
-- Menu bar background operation after closing the main window.
 
 ## Permissions
 

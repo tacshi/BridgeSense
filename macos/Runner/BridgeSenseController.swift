@@ -3,6 +3,7 @@ import Cocoa
 import CoreHaptics
 import FlutterMacOS
 import GameController
+import IOKit.hid
 
 final class BridgeSenseController: NSObject, FlutterStreamHandler {
   static let shared = BridgeSenseController()
@@ -23,6 +24,8 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   private var lastEmit = Date.distantPast
   private var hapticEngine: CHHapticEngine?
   private var previousTouchpadPoint: CGPoint?
+  private var rawTouchpadSample = TouchpadSample.inactive
+  private let rawTouchpadReader = RawDualSenseTouchpadReader()
 
   private var mappings: [BridgeMapping] = BridgeMapping.defaults
   private var settings = BridgeSettings.defaults
@@ -30,8 +33,12 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
 
   private override init() {
     super.init()
+    rawTouchpadReader.onSample = { [weak self] sample in
+      self?.handleRawTouchpadSample(sample)
+    }
     loadState()
     observeControllers()
+    rawTouchpadReader.start()
     startPolling()
   }
 
@@ -108,6 +115,8 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     }
 
     previousPressed.removeAll()
+    previousTouchpadPoint = nil
+    rawTouchpadSample = .inactive
     inputValues = readInputs()
     lastAction = currentController == nil ? "Waiting for controller" : reason
     emitSnapshot(force: true)
@@ -190,10 +199,26 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   private func applyTouchpadMapping(_ mapping: BridgeMapping) {
-    let point = CGPoint(
-      x: inputValues["touchpadX"] ?? 0,
-      y: inputValues["touchpadY"] ?? 0
+    applyTouchpadSample(
+      TouchpadSample(
+        point: CGPoint(
+          x: inputValues["touchpadX"] ?? 0,
+          y: inputValues["touchpadY"] ?? 0
+        ),
+        button: inputValues["touchpad"] ?? 0,
+        active: (inputValues["touchpadActive"] ?? 0) >= 0.5
+      ),
+      mapping: mapping
     )
+  }
+
+  private func applyTouchpadSample(_ sample: TouchpadSample, mapping: BridgeMapping) {
+    guard sample.active else {
+      previousTouchpadPoint = nil
+      return
+    }
+
+    let point = sample.point
     defer { previousTouchpadPoint = point }
 
     guard let previousTouchpadPoint else {
@@ -222,6 +247,24 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     default:
       break
     }
+  }
+
+  private func handleRawTouchpadSample(_ sample: TouchpadSample) {
+    rawTouchpadSample = sample
+    inputValues["touchpad"] = sample.button
+    inputValues["touchpadX"] = sample.active ? Double(sample.point.x) : 0
+    inputValues["touchpadY"] = sample.active ? Double(sample.point.y) : 0
+    inputValues["touchpadActive"] = sample.active ? 1 : 0
+
+    guard bridgeEnabled,
+      accessibilityTrusted(prompt: false),
+      let mapping = mappings.first(where: { $0.id == "touchpadMotion" }) else {
+      emitSnapshot()
+      return
+    }
+
+    applyTouchpadSample(sample, mapping: mapping)
+    emitSnapshot()
   }
 
   private func perform(mapping: BridgeMapping) {
@@ -405,20 +448,95 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       "touchpad": 0,
       "touchpadX": 0,
       "touchpadY": 0,
+      "touchpadActive": 0,
     ]
 
     if #available(macOS 11.0, *) {
       values["home"] = Double(gamepad.buttonHome?.value ?? 0)
     }
 
-    if #available(macOS 11.3, *),
-      let dualSense = gamepad as? GCDualSenseGamepad {
-      values["touchpad"] = Double(dualSense.touchpadButton.value)
-      values["touchpadX"] = Double(dualSense.touchpadPrimary.xAxis.value)
-      values["touchpadY"] = Double(dualSense.touchpadPrimary.yAxis.value)
-    }
+    let touchpadSample = readTouchpadSample(gamepad: gamepad)
+    values["touchpad"] = touchpadSample.button
+    values["touchpadX"] = touchpadSample.active ? Double(touchpadSample.point.x) : 0
+    values["touchpadY"] = touchpadSample.active ? Double(touchpadSample.point.y) : 0
+    values["touchpadActive"] = touchpadSample.active ? 1 : 0
 
     return values
+  }
+
+  private func readTouchpadSample(gamepad: GCExtendedGamepad) -> TouchpadSample {
+    if rawTouchpadSample.active {
+      return rawTouchpadSample
+    }
+
+    if #available(macOS 11.0, *),
+      let touchpad = currentControllerTouchpad() {
+      let active = touchpad.touchState == .down || touchpad.touchState == .moving
+      if active {
+        return TouchpadSample(
+          point: CGPoint(
+            x: Double(touchpad.touchSurface.xAxis.value),
+            y: Double(touchpad.touchSurface.yAxis.value)
+          ),
+          button: Double(touchpad.button.value),
+          active: true
+        )
+      }
+    }
+
+    if #available(macOS 11.3, *),
+      let dualSense = gamepad as? GCDualSenseGamepad {
+      return directionalTouchpadSample(
+        dpad: dualSense.touchpadPrimary,
+        button: dualSense.touchpadButton
+      )
+    }
+
+    if #available(macOS 11.0, *),
+      let dualShock = gamepad as? GCDualShockGamepad {
+      return directionalTouchpadSample(
+        dpad: dualShock.touchpadPrimary,
+        button: dualShock.touchpadButton
+      )
+    }
+
+    return .inactive
+  }
+
+  @available(macOS 11.0, *)
+  private func currentControllerTouchpad() -> GCControllerTouchpad? {
+    guard let currentController else {
+      return nil
+    }
+    let touchpads = currentController.physicalInputProfile.touchpads
+    return touchpads.values.first { touchpad in
+      touchpad.touchState == .down || touchpad.touchState == .moving
+    } ?? touchpads[GCInputDualShockTouchpadOne] ?? touchpads.values.first
+  }
+
+  private func directionalTouchpadSample(
+    dpad: GCControllerDirectionPad,
+    button: GCControllerButtonInput
+  ) -> TouchpadSample {
+    let point = CGPoint(
+      x: Double(dpad.xAxis.value),
+      y: Double(dpad.yAxis.value)
+    )
+    let buttonValue = Double(button.value)
+
+    if isDirectionalTouchpadResting(point) {
+      return .inactive(button: buttonValue)
+    }
+
+    return TouchpadSample(
+      point: point,
+      button: buttonValue,
+      active: true
+    )
+  }
+
+  private func isDirectionalTouchpadResting(_ point: CGPoint) -> Bool {
+    abs(Double(point.x) + 1) < 0.001 && abs(Double(point.y) - 1) < 0.001
   }
 
   private func handle(call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -699,6 +817,438 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     }
     dualSense.leftTrigger.setModeOff()
     dualSense.rightTrigger.setModeOff()
+  }
+}
+
+private final class RawDualSenseTouchpadReader {
+  private static let vendorID = 0x054c
+  private static let productIDs = [0x0ce6, 0x0df2]
+  private static let touchpadWidth = 1920.0
+  private static let touchpadHeight = 1080.0
+
+  var onSample: ((TouchpadSample) -> Void)?
+
+  private var manager: IOHIDManager?
+  private var devices: [String: DeviceRegistration] = [:]
+  private let devicesLock = NSLock()
+  private let pollQueue = DispatchQueue(
+    label: "BridgeSense.RawDualSenseTouchpadReader.poll",
+    qos: .userInitiated
+  )
+  private var pollTimer: DispatchSourceTimer?
+
+  deinit {
+    stop()
+  }
+
+  func start() {
+    guard manager == nil else {
+      return
+    }
+
+    let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+    IOHIDManagerSetDeviceMatching(
+      manager,
+      [kIOHIDVendorIDKey: Self.vendorID] as CFDictionary
+    )
+
+    let context = Unmanaged.passUnretained(self).toOpaque()
+    IOHIDManagerRegisterDeviceMatchingCallback(
+      manager,
+      Self.deviceMatchedCallback,
+      context
+    )
+    IOHIDManagerRegisterDeviceRemovalCallback(
+      manager,
+      Self.deviceRemovedCallback,
+      context
+    )
+    IOHIDManagerScheduleWithRunLoop(
+      manager,
+      CFRunLoopGetMain(),
+      CFRunLoopMode.commonModes.rawValue
+    )
+    let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    guard openResult == kIOReturnSuccess else {
+      NSLog("BridgeSense: failed to open DualSense HID manager: 0x%08x", openResult)
+      IOHIDManagerUnscheduleFromRunLoop(
+        manager,
+        CFRunLoopGetMain(),
+        CFRunLoopMode.commonModes.rawValue
+      )
+      return
+    }
+
+    self.manager = manager
+
+    if let existingDevices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> {
+      for device in existingDevices {
+        register(device: device)
+      }
+    }
+  }
+
+  func stop() {
+    guard let manager else {
+      return
+    }
+
+    stopPolling()
+
+    devicesLock.lock()
+    let registrations = Array(devices.values)
+    devices.removeAll()
+    devicesLock.unlock()
+
+    for registration in registrations {
+      IOHIDDeviceRegisterInputReportCallback(
+        registration.device,
+        registration.reportBuffer,
+        registration.reportLength,
+        nil,
+        nil
+      )
+      IOHIDDeviceUnscheduleFromRunLoop(
+        registration.device,
+        CFRunLoopGetMain(),
+        CFRunLoopMode.commonModes.rawValue
+      )
+      registration.reportBuffer.deallocate()
+    }
+
+    IOHIDManagerUnscheduleFromRunLoop(
+      manager,
+      CFRunLoopGetMain(),
+      CFRunLoopMode.commonModes.rawValue
+    )
+    IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    self.manager = nil
+  }
+
+  private func register(device: IOHIDDevice) {
+    guard isDualSense(device: device) else {
+      return
+    }
+
+    let key = deviceKey(device)
+    let reportLength = max(inputReportLength(for: device), 128)
+    let reportBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: reportLength)
+    reportBuffer.initialize(repeating: 0, count: reportLength)
+
+    let registration = DeviceRegistration(
+      device: device,
+      reportBuffer: reportBuffer,
+      reportLength: reportLength
+    )
+
+    devicesLock.lock()
+    if devices[key] == nil {
+      devices[key] = registration
+      devicesLock.unlock()
+    } else {
+      devicesLock.unlock()
+      reportBuffer.deallocate()
+      return
+    }
+
+    startPollingIfNeeded()
+
+    IOHIDDeviceRegisterInputReportCallback(
+      device,
+      reportBuffer,
+      reportLength,
+      Self.inputReportCallback,
+      Unmanaged.passUnretained(self).toOpaque()
+    )
+    IOHIDDeviceScheduleWithRunLoop(
+      device,
+      CFRunLoopGetMain(),
+      CFRunLoopMode.commonModes.rawValue
+    )
+  }
+
+  private func remove(device: IOHIDDevice) {
+    let key = deviceKey(device)
+    devicesLock.lock()
+    let registration = devices.removeValue(forKey: key)
+    let isEmpty = devices.isEmpty
+    devicesLock.unlock()
+
+    guard let registration else {
+      return
+    }
+
+    IOHIDDeviceRegisterInputReportCallback(
+      registration.device,
+      registration.reportBuffer,
+      registration.reportLength,
+      nil,
+      nil
+    )
+    IOHIDDeviceUnscheduleFromRunLoop(
+      registration.device,
+      CFRunLoopGetMain(),
+      CFRunLoopMode.commonModes.rawValue
+    )
+    registration.reportBuffer.deallocate()
+    if isEmpty {
+      stopPolling()
+    }
+  }
+
+  private func handle(reportID: UInt32, report: UnsafeMutablePointer<UInt8>, length: Int) {
+    guard let sample = Self.touchpadSample(reportID: reportID, report: report, length: length) else {
+      return
+    }
+
+    DispatchQueue.main.async { [weak self] in
+      self?.onSample?(sample)
+    }
+  }
+
+  private func pollFullReports() {
+    let registrations = registeredDevices()
+    guard !registrations.isEmpty else {
+      DispatchQueue.main.async { [weak self] in
+        self?.stopPolling()
+      }
+      return
+    }
+
+    for registration in registrations {
+      if let sample = copyFullReportSample(
+        device: registration.device,
+        reportID: 0x31,
+        length: registration.reportLength
+      ) ?? copyFullReportSample(
+        device: registration.device,
+        reportID: 0x01,
+        length: registration.reportLength
+      ) {
+        DispatchQueue.main.async { [weak self] in
+          self?.onSample?(sample)
+        }
+      }
+    }
+  }
+
+  private func registeredDevices() -> [DeviceRegistration] {
+    devicesLock.lock()
+    defer { devicesLock.unlock() }
+    return Array(devices.values)
+  }
+
+  private func startPollingIfNeeded() {
+    devicesLock.lock()
+    let shouldStart = !devices.isEmpty && pollTimer == nil
+    devicesLock.unlock()
+    guard shouldStart else {
+      return
+    }
+
+    let timer = DispatchSource.makeTimerSource(queue: pollQueue)
+    timer.schedule(deadline: .now(), repeating: 1.0 / 60.0)
+    timer.setEventHandler { [weak self] in
+      self?.pollFullReports()
+    }
+    devicesLock.lock()
+    if pollTimer == nil {
+      pollTimer = timer
+      devicesLock.unlock()
+      timer.resume()
+    } else {
+      devicesLock.unlock()
+      timer.cancel()
+    }
+  }
+
+  private func stopPolling() {
+    devicesLock.lock()
+    let timer = pollTimer
+    pollTimer = nil
+    devicesLock.unlock()
+    timer?.cancel()
+  }
+
+  private func copyFullReportSample(
+    device: IOHIDDevice,
+    reportID: CFIndex,
+    length: Int
+  ) -> TouchpadSample? {
+    var report = [UInt8](repeating: 0, count: length)
+    var reportLength = report.count
+    let result = report.withUnsafeMutableBufferPointer { buffer in
+      IOHIDDeviceGetReport(
+        device,
+        kIOHIDReportTypeInput,
+        reportID,
+        buffer.baseAddress!,
+        &reportLength
+      )
+    }
+    guard result == kIOReturnSuccess else {
+      return nil
+    }
+    return report.withUnsafeMutableBufferPointer { buffer in
+      guard let baseAddress = buffer.baseAddress else {
+        return nil
+      }
+      return Self.touchpadSample(
+        reportID: UInt32(reportID),
+        report: baseAddress,
+        length: reportLength
+      )
+    }
+  }
+
+  private static func touchpadSample(
+    reportID: UInt32,
+    report: UnsafeMutablePointer<UInt8>,
+    length: Int
+  ) -> TouchpadSample? {
+    guard length > 0 else {
+      return nil
+    }
+
+    let firstByte = report[0]
+    let effectiveReportID = reportID == 0 ? UInt32(firstByte) : reportID
+    let commonOffset: Int
+
+    switch effectiveReportID {
+    case 0x01:
+      commonOffset = firstByte == 0x01 ? 1 : 0
+    case 0x31:
+      commonOffset = firstByte == 0x31 ? 2 : 1
+    default:
+      return nil
+    }
+
+    let buttons2Offset = commonOffset + 9
+    let pointsOffset = commonOffset + 32
+    guard length >= pointsOffset + 8, length > buttons2Offset else {
+      return nil
+    }
+
+    let button = (report[buttons2Offset] & 0x02) != 0 ? 1.0 : 0.0
+
+    for pointIndex in 0..<2 {
+      let offset = pointsOffset + pointIndex * 4
+      let contact = report[offset]
+      let active = (contact & 0x80) == 0
+      guard active else {
+        continue
+      }
+
+      let x = Int(report[offset + 1]) | (Int(report[offset + 2] & 0x0f) << 8)
+      let y = Int(report[offset + 2] >> 4) | (Int(report[offset + 3]) << 4)
+      return TouchpadSample(
+        point: CGPoint(
+          x: normalizeX(x),
+          y: normalizeY(y)
+        ),
+        button: button,
+        active: true
+      )
+    }
+
+    return .inactive(button: button)
+  }
+
+  private static func normalizeX(_ value: Int) -> Double {
+    clamp((Double(value) / (touchpadWidth - 1)) * 2 - 1)
+  }
+
+  private static func normalizeY(_ value: Int) -> Double {
+    clamp(1 - (Double(value) / (touchpadHeight - 1)) * 2)
+  }
+
+  private static func clamp(_ value: Double) -> Double {
+    min(max(value, -1), 1)
+  }
+
+  private func inputReportLength(for device: IOHIDDevice) -> Int {
+    let value = IOHIDDeviceGetProperty(device, kIOHIDMaxInputReportSizeKey as CFString)
+    return (value as? NSNumber)?.intValue ?? 128
+  }
+
+  private func isDualSense(device: IOHIDDevice) -> Bool {
+    if let productID = IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? NSNumber,
+      Self.productIDs.contains(productID.intValue) {
+      return true
+    }
+
+    let product = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String
+    return product?.localizedCaseInsensitiveContains("DualSense") == true
+  }
+
+  private func deviceKey(_ device: IOHIDDevice) -> String {
+    String(describing: Unmanaged.passUnretained(device).toOpaque())
+  }
+
+  private struct DeviceRegistration {
+    let device: IOHIDDevice
+    let reportBuffer: UnsafeMutablePointer<UInt8>
+    let reportLength: Int
+  }
+
+  private static let deviceMatchedCallback: IOHIDDeviceCallback = {
+    context,
+    _,
+    _,
+    device in
+    guard let context else {
+      return
+    }
+    let reader = Unmanaged<RawDualSenseTouchpadReader>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    reader.register(device: device)
+  }
+
+  private static let deviceRemovedCallback: IOHIDDeviceCallback = {
+    context,
+    _,
+    _,
+    device in
+    guard let context else {
+      return
+    }
+    let reader = Unmanaged<RawDualSenseTouchpadReader>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    reader.remove(device: device)
+  }
+
+  private static let inputReportCallback: IOHIDReportCallback = {
+    context,
+    result,
+    _,
+    reportType,
+    reportID,
+    report,
+    reportLength in
+    guard result == kIOReturnSuccess,
+      reportType == kIOHIDReportTypeInput,
+      let context else {
+      return
+    }
+
+    let reader = Unmanaged<RawDualSenseTouchpadReader>
+      .fromOpaque(context)
+      .takeUnretainedValue()
+    reader.handle(reportID: reportID, report: report, length: reportLength)
+  }
+}
+
+private struct TouchpadSample {
+  static let inactive = TouchpadSample(point: .zero, button: 0, active: false)
+
+  let point: CGPoint
+  let button: Double
+  let active: Bool
+
+  static func inactive(button: Double) -> TouchpadSample {
+    TouchpadSample(point: .zero, button: button, active: false)
   }
 }
 

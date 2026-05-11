@@ -13,17 +13,15 @@ WORK_DIR="$ROOT_DIR/build/releash"
 STAGING_DIR="$WORK_DIR/staging"
 DMG_ROOT="$WORK_DIR/dmg-root"
 STAGED_APP="$STAGING_DIR/$APP_BUNDLE_NAME"
-VERSION="${VERSION:-$(awk '/^version:/ {print $2; exit}' pubspec.yaml)}"
-VERSION="${VERSION%%+*}"
-DMG_PATH="${DMG_PATH:-$ROOT_DIR/${APP_DISPLAY_NAME}-${VERSION}.dmg}"
 ASC_KEY_PATH="${APP_STORE_CONNECT_API_KEY_PATH:-${APP_STORE_CONNECT_KEY_PATH:-}}"
 NOTARYTOOL_PROFILE="${NOTARYTOOL_PROFILE:-BridgeSense}"
 
 usage() {
   cat <<USAGE
-Usage: DEVELOPER_ID_APPLICATION="Developer ID Application: ..." scripts/releash.sh
+Usage: DEVELOPER_ID_APPLICATION="Developer ID Application: ..." scripts/releash.sh <version>
 
 Required:
+  version                   Release version, for example 1.0.1.
   DEVELOPER_ID_APPLICATION  Developer ID Application signing identity.
 
 Notarization credentials:
@@ -36,7 +34,6 @@ Alternate notarization credentials:
 Optional:
   APP_DISPLAY_NAME          Defaults to BridgeSense.
   PRODUCT_NAME              Defaults to bridge_sense.
-  VERSION                   Defaults to pubspec version without +build.
   DMG_PATH                  Defaults to ./BridgeSense-\$VERSION.dmg.
 USAGE
 }
@@ -81,12 +78,23 @@ sign_code() {
   exit 0
 }
 
+[[ $# -eq 1 ]] || {
+  usage
+  fail "version argument is required"
+}
+
+VERSION="$1"
+[[ "$VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] || {
+  usage
+  fail "version must use x.y.z format, for example 1.0.1"
+}
+DMG_PATH="${DMG_PATH:-$ROOT_DIR/${APP_DISPLAY_NAME}-${VERSION}.dmg}"
+
 [[ -n "${DEVELOPER_ID_APPLICATION:-}" ]] || {
   usage
   fail "DEVELOPER_ID_APPLICATION is required"
 }
 
-require_tool awk
 require_tool codesign
 require_tool ditto
 require_tool flutter
@@ -97,7 +105,7 @@ xcrun -f stapler >/dev/null
 notary_args
 
 echo "Building release app..."
-flutter build macos --release
+flutter build macos --release --build-name "$VERSION"
 [[ -d "$SOURCE_APP" ]] || fail "release app not found: $SOURCE_APP"
 [[ -f "$ENTITLEMENTS" ]] || fail "entitlements not found: $ENTITLEMENTS"
 

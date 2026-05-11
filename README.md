@@ -70,7 +70,7 @@ Run a release:
 
 ```bash
 DEVELOPER_ID_APPLICATION="Developer ID Application: Example Name (TEAMID)" \
-  ./scripts/releash.sh
+  ./scripts/releash.sh 1.0.1
 ```
 
 The output is written to the project root as `BridgeSense-<version>.dmg`.

@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 APP_DISPLAY_NAME="${APP_DISPLAY_NAME:-BridgeSense}"
-PRODUCT_NAME="${PRODUCT_NAME:-bridge_sense}"
+PRODUCT_NAME="${PRODUCT_NAME:-BridgeSense}"
 APP_BUNDLE_NAME="${APP_DISPLAY_NAME}.app"
 SOURCE_APP="$ROOT_DIR/build/macos/Build/Products/Release/${PRODUCT_NAME}.app"
 ENTITLEMENTS="$ROOT_DIR/macos/Runner/Release.entitlements"
@@ -33,7 +33,7 @@ Alternate notarization credentials:
 
 Optional:
   APP_DISPLAY_NAME          Defaults to BridgeSense.
-  PRODUCT_NAME              Defaults to bridge_sense.
+  PRODUCT_NAME              Defaults to BridgeSense.
   DMG_PATH                  Defaults to ./\$APP_DISPLAY_NAME-\$VERSION.dmg.
   GITHUB_RELEASE_TAG        Defaults to v\$VERSION.
   GITHUB_RELEASE_TITLE      Defaults to "\$APP_DISPLAY_NAME \$VERSION".

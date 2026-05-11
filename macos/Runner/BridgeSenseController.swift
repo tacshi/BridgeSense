@@ -343,10 +343,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
 
     if mapping.vibrate || mapping.action == .haptic {
       do {
-        try playHaptic(
-          style: mapping.hapticStyle,
-          configureTriggers: adaptiveTriggerSide(for: mapping.id) == nil
-        )
+        try playHaptic(style: mapping.hapticStyle)
         let hapticDescription = "vibration \(mapping.hapticStyle)"
         if let existingDescription = actionDescription {
           actionDescription = "\(existingDescription); \(hapticDescription)"
@@ -759,7 +756,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     return AXIsProcessTrustedWithOptions(options as CFDictionary)
   }
 
-  private func playHaptic(style: String, configureTriggers: Bool = true) throws {
+  private func playHaptic(style: String) throws {
     guard #available(macOS 11.0, *) else {
       throw BridgeSenseError.hapticsUnavailable
     }
@@ -771,9 +768,6 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     hapticEngine = engine
     try engine.start()
     try playPattern(style: style, engine: engine)
-    if configureTriggers {
-      configureAdaptiveTriggers(style: style)
-    }
   }
 
   @available(macOS 11.0, *)

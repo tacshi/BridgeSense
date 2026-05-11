@@ -17,7 +17,7 @@ available from the menu bar when the main window is closed.
 - Remappable buttons for keyboard shortcuts and mouse clicks.
 - Optional per-button vibration using `Drive`, `Shoot`, and `Pulse` haptic
   patterns.
-- DualSense adaptive trigger effects tied to vibration-enabled trigger
+- DualSense adaptive trigger effects for vibration-enabled L2/R2 trigger
   bindings.
 - Menu bar background operation after closing the main window.
 

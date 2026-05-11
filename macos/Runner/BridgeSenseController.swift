@@ -1,0 +1,923 @@
+import ApplicationServices
+import Cocoa
+import CoreHaptics
+import FlutterMacOS
+import GameController
+
+final class BridgeSenseController: NSObject, FlutterStreamHandler {
+  static let shared = BridgeSenseController()
+
+  private let mappingsKey = "BridgeSenseMappingsV2"
+  private let settingsKey = "BridgeSenseSettingsV1"
+  private let enabledKey = "BridgeSenseEnabledV1"
+  private let buttonThreshold = 0.55
+
+  private var methodChannel: FlutterMethodChannel?
+  private var eventChannel: FlutterEventChannel?
+  private var eventSink: FlutterEventSink?
+  private var pollTimer: Timer?
+  private var currentController: GCController?
+  private var previousPressed: [String: Bool] = [:]
+  private var inputValues: [String: Double] = [:]
+  private var lastAction = ""
+  private var lastEmit = Date.distantPast
+  private var hapticEngine: CHHapticEngine?
+  private var previousTouchpadPoint: CGPoint?
+
+  private var mappings: [BridgeMapping] = BridgeMapping.defaults
+  private var settings = BridgeSettings.defaults
+  private var bridgeEnabled = true
+
+  private override init() {
+    super.init()
+    loadState()
+    observeControllers()
+    startPolling()
+  }
+
+  func configure(binaryMessenger: FlutterBinaryMessenger) {
+    methodChannel = FlutterMethodChannel(
+      name: "bridge_sense/control",
+      binaryMessenger: binaryMessenger
+    )
+    eventChannel = FlutterEventChannel(
+      name: "bridge_sense/events",
+      binaryMessenger: binaryMessenger
+    )
+    methodChannel?.setMethodCallHandler { [weak self] call, result in
+      self?.handle(call: call, result: result)
+    }
+    eventChannel?.setStreamHandler(self)
+    refreshController(reason: "Ready")
+  }
+
+  func onListen(
+    withArguments arguments: Any?,
+    eventSink events: @escaping FlutterEventSink
+  ) -> FlutterError? {
+    eventSink = events
+    emitSnapshot(force: true)
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    eventSink = nil
+    return nil
+  }
+
+  private func observeControllers() {
+    if #available(macOS 11.3, *) {
+      GCController.shouldMonitorBackgroundEvents = true
+    }
+
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(controllerDidChange(_:)),
+      name: .GCControllerDidConnect,
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(controllerDidChange(_:)),
+      name: .GCControllerDidDisconnect,
+      object: nil
+    )
+
+    GCController.startWirelessControllerDiscovery(completionHandler: nil)
+  }
+
+  @objc private func controllerDidChange(_ notification: Notification) {
+    refreshController(reason: "Controller updated")
+  }
+
+  private func refreshController(reason: String) {
+    let candidates = GCController.controllers().filter { $0.extendedGamepad != nil }
+    let preferred = candidates.first { controller in
+      controller.vendorName?.localizedCaseInsensitiveContains("DualSense") == true
+        || controller.productCategory.localizedCaseInsensitiveContains("DualSense")
+    }
+
+    if let preferred {
+      currentController = preferred
+    } else if #available(macOS 11.0, *),
+      let current = GCController.current,
+      current.extendedGamepad != nil {
+      currentController = current
+    } else {
+      currentController = candidates.first
+    }
+
+    previousPressed.removeAll()
+    inputValues = readInputs()
+    lastAction = currentController == nil ? "Waiting for controller" : reason
+    emitSnapshot(force: true)
+  }
+
+  private func startPolling() {
+    pollTimer?.invalidate()
+    pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) {
+      [weak self] _ in
+      self?.poll()
+    }
+    RunLoop.main.add(pollTimer!, forMode: .common)
+  }
+
+  private func poll() {
+    guard currentController?.extendedGamepad != nil else {
+      emitSnapshot()
+      return
+    }
+
+    inputValues = readInputs()
+
+    if bridgeEnabled {
+      applyContinuousMappings()
+      applyButtonMappings()
+    }
+
+    emitSnapshot()
+  }
+
+  private func applyContinuousMappings() {
+    guard accessibilityTrusted(prompt: false) else {
+      return
+    }
+
+    for mapping in mappings where isContinuousMapping(mapping.id) {
+      if mapping.id == "touchpadMotion" {
+        applyTouchpadMapping(mapping)
+        continue
+      }
+
+      let xKey = mapping.id == "leftStick" ? "leftStickX" : "rightStickX"
+      let yKey = mapping.id == "leftStick" ? "leftStickY" : "rightStickY"
+      let x = filteredAxis(inputValues[xKey] ?? 0)
+      let y = filteredAxis(inputValues[yKey] ?? 0)
+
+      switch mapping.action {
+      case .cursor:
+        if abs(x) > 0 || abs(y) > 0 {
+          moveCursor(x: x, y: y)
+        }
+      case .scroll:
+        if abs(x) > 0 || abs(y) > 0 {
+          scroll(x: x, y: y)
+        }
+      default:
+        break
+      }
+    }
+  }
+
+  private func applyButtonMappings() {
+    let buttonValues = inputValues.filter { key, _ in
+      !key.hasSuffix("X") && !key.hasSuffix("Y")
+    }
+
+    for mapping in mappings where !isContinuousMapping(mapping.id) {
+      let value = buttonValues[mapping.id] ?? 0
+      let pressed = value >= buttonThreshold
+      let wasPressed = previousPressed[mapping.id] ?? false
+      if pressed && !wasPressed {
+        perform(mapping: mapping)
+      }
+      previousPressed[mapping.id] = pressed
+    }
+  }
+
+  private func isContinuousMapping(_ id: String) -> Bool {
+    id == "leftStick" || id == "rightStick" || id == "touchpadMotion"
+  }
+
+  private func applyTouchpadMapping(_ mapping: BridgeMapping) {
+    let point = CGPoint(
+      x: inputValues["touchpadX"] ?? 0,
+      y: inputValues["touchpadY"] ?? 0
+    )
+    defer { previousTouchpadPoint = point }
+
+    guard let previousTouchpadPoint else {
+      return
+    }
+
+    let dx = Double(point.x - previousTouchpadPoint.x)
+    let dy = Double(point.y - previousTouchpadPoint.y)
+    guard abs(dx) > 0.002 || abs(dy) > 0.002 else {
+      return
+    }
+    guard abs(dx) <= 0.45 && abs(dy) <= 0.45 else {
+      return
+    }
+
+    switch mapping.action {
+    case .cursor:
+      let scale = settings.pointerSpeed * 8
+      moveCursorBy(dx: CGFloat(dx * scale), dy: CGFloat(-dy * scale))
+    case .scroll:
+      let scale = settings.scrollSpeed * 10
+      scrollDelta(
+        horizontal: Int32((dx * scale).rounded()),
+        vertical: Int32((dy * scale).rounded())
+      )
+    default:
+      break
+    }
+  }
+
+  private func perform(mapping: BridgeMapping) {
+    var actionDescription: String?
+
+    switch mapping.action {
+    case .key:
+      guard accessibilityTrusted(prompt: false) else {
+        actionDescription = "Accessibility permission required"
+        break
+      }
+      guard let keyCode = mapping.keyCode else {
+        break
+      }
+      postKeyTap(keyCode: keyCode, modifiers: mapping.modifiers)
+      let purpose = mapping.label.isEmpty ? mapping.controlLabel : mapping.label
+      actionDescription = "\(mapping.controlLabel): \(purpose) -> \(mapping.keyLabel)"
+    case .mouseClick:
+      guard accessibilityTrusted(prompt: false) else {
+        actionDescription = "Accessibility permission required"
+        break
+      }
+      postMouseClick(button: mapping.mouseButton)
+      actionDescription = "\(mapping.controlLabel): \(mapping.mouseButton.actionDescription)"
+    default:
+      break
+    }
+
+    if mapping.vibrate || mapping.action == .haptic {
+      do {
+        try playHaptic(style: mapping.hapticStyle)
+        let hapticDescription = "vibration \(mapping.hapticStyle)"
+        if let existingDescription = actionDescription {
+          actionDescription = "\(existingDescription); \(hapticDescription)"
+        } else {
+          actionDescription = "\(mapping.controlLabel): \(hapticDescription)"
+        }
+      } catch {
+        actionDescription = actionDescription ?? "Vibration unavailable"
+      }
+    }
+
+    if let actionDescription {
+      lastAction = actionDescription
+    }
+    emitSnapshot(force: true)
+  }
+
+  private func filteredAxis(_ value: Double) -> Double {
+    abs(value) < settings.deadZone ? 0 : value
+  }
+
+  private func moveCursor(x: Double, y: Double) {
+    let dx = CGFloat(x * settings.pointerSpeed)
+    let dy = CGFloat(-y * settings.pointerSpeed)
+    moveCursorBy(dx: dx, dy: dy)
+  }
+
+  private func moveCursorBy(dx: CGFloat, dy: CGFloat) {
+    guard let event = CGEvent(source: nil) else {
+      return
+    }
+
+    let current = event.location
+    let next = CGPoint(x: current.x + dx, y: current.y + dy)
+    CGEvent(
+      mouseEventSource: nil,
+      mouseType: .mouseMoved,
+      mouseCursorPosition: next,
+      mouseButton: .left
+    )?.post(tap: .cghidEventTap)
+  }
+
+  private func scroll(x: Double, y: Double) {
+    let horizontal = Int32((x * settings.scrollSpeed).rounded())
+    let vertical = Int32((y * settings.scrollSpeed).rounded())
+    scrollDelta(horizontal: horizontal, vertical: vertical)
+  }
+
+  private func scrollDelta(horizontal: Int32, vertical: Int32) {
+    guard horizontal != 0 || vertical != 0 else {
+      return
+    }
+    CGEvent(
+      scrollWheelEvent2Source: nil,
+      units: .pixel,
+      wheelCount: 2,
+      wheel1: vertical,
+      wheel2: horizontal,
+      wheel3: 0
+    )?.post(tap: .cghidEventTap)
+  }
+
+  private func postMouseClick(button: MouseButton) {
+    guard let event = CGEvent(source: nil) else {
+      return
+    }
+    let point = event.location
+    CGEvent(
+      mouseEventSource: nil,
+      mouseType: button.downEvent,
+      mouseCursorPosition: point,
+      mouseButton: button.cgButton
+    )?.post(tap: .cghidEventTap)
+    CGEvent(
+      mouseEventSource: nil,
+      mouseType: button.upEvent,
+      mouseCursorPosition: point,
+      mouseButton: button.cgButton
+    )?.post(tap: .cghidEventTap)
+  }
+
+  private func postKeyTap(keyCode: UInt16, modifiers: [String]) {
+    let source = CGEventSource(stateID: .hidSystemState)
+    let flags = eventFlags(from: modifiers)
+    let keyDown = CGEvent(
+      keyboardEventSource: source,
+      virtualKey: keyCode,
+      keyDown: true
+    )
+    keyDown?.flags = flags
+    keyDown?.post(tap: .cghidEventTap)
+
+    let keyUp = CGEvent(
+      keyboardEventSource: source,
+      virtualKey: keyCode,
+      keyDown: false
+    )
+    keyUp?.flags = flags
+    keyUp?.post(tap: .cghidEventTap)
+  }
+
+  private func eventFlags(from modifiers: [String]) -> CGEventFlags {
+    var flags = CGEventFlags()
+    for modifier in modifiers {
+      switch modifier {
+      case "command":
+        flags.insert(.maskCommand)
+      case "shift":
+        flags.insert(.maskShift)
+      case "option":
+        flags.insert(.maskAlternate)
+      case "control":
+        flags.insert(.maskControl)
+      default:
+        break
+      }
+    }
+    return flags
+  }
+
+  private func readInputs() -> [String: Double] {
+    guard let gamepad = currentController?.extendedGamepad else {
+      return [:]
+    }
+
+    var values: [String: Double] = [
+      "leftStickX": Double(gamepad.leftThumbstick.xAxis.value),
+      "leftStickY": Double(gamepad.leftThumbstick.yAxis.value),
+      "rightStickX": Double(gamepad.rightThumbstick.xAxis.value),
+      "rightStickY": Double(gamepad.rightThumbstick.yAxis.value),
+      "dpadX": Double(gamepad.dpad.xAxis.value),
+      "dpadY": Double(gamepad.dpad.yAxis.value),
+      "dpadUp": Double(gamepad.dpad.up.value),
+      "dpadDown": Double(gamepad.dpad.down.value),
+      "dpadLeft": Double(gamepad.dpad.left.value),
+      "dpadRight": Double(gamepad.dpad.right.value),
+      "cross": Double(gamepad.buttonA.value),
+      "circle": Double(gamepad.buttonB.value),
+      "square": Double(gamepad.buttonX.value),
+      "triangle": Double(gamepad.buttonY.value),
+      "l1": Double(gamepad.leftShoulder.value),
+      "r1": Double(gamepad.rightShoulder.value),
+      "l2": Double(gamepad.leftTrigger.value),
+      "r2": Double(gamepad.rightTrigger.value),
+      "menu": Double(gamepad.buttonMenu.value),
+      "options": Double(gamepad.buttonOptions?.value ?? 0),
+      "leftStickButton": Double(gamepad.leftThumbstickButton?.value ?? 0),
+      "rightStickButton": Double(gamepad.rightThumbstickButton?.value ?? 0),
+      "home": 0,
+      "touchpad": 0,
+      "touchpadX": 0,
+      "touchpadY": 0,
+    ]
+
+    if #available(macOS 11.0, *) {
+      values["home"] = Double(gamepad.buttonHome?.value ?? 0)
+    }
+
+    if #available(macOS 11.3, *),
+      let dualSense = gamepad as? GCDualSenseGamepad {
+      values["touchpad"] = Double(dualSense.touchpadButton.value)
+      values["touchpadX"] = Double(dualSense.touchpadPrimary.xAxis.value)
+      values["touchpadY"] = Double(dualSense.touchpadPrimary.yAxis.value)
+    }
+
+    return values
+  }
+
+  private func handle(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "getSnapshot":
+      result(snapshot())
+    case "setBridgeEnabled":
+      bridgeEnabled = (call.arguments as? Bool) ?? true
+      UserDefaults.standard.set(bridgeEnabled, forKey: enabledKey)
+      emitSnapshot(force: true)
+      result(nil)
+    case "setMappings":
+      guard let rawMappings = call.arguments as? [[String: Any]] else {
+        result(FlutterError(code: "bad_args", message: "Expected mappings", details: nil))
+        return
+      }
+      mappings = normalizeMappings(rawMappings.compactMap(BridgeMapping.init(dictionary:)))
+      saveMappings()
+      emitSnapshot(force: true)
+      result(nil)
+    case "setSettings":
+      settings = BridgeSettings(dictionary: call.arguments as? [String: Any]) ?? .defaults
+      saveSettings()
+      emitSnapshot(force: true)
+      result(nil)
+    case "resetMappings":
+      mappings = BridgeMapping.defaults
+      saveMappings()
+      emitSnapshot(force: true)
+      result(snapshot())
+    case "requestAccessibility":
+      let trusted = accessibilityTrusted(prompt: true)
+      lastAction = trusted ? "Accessibility trusted" : "Accessibility requested"
+      emitSnapshot(force: true)
+      result(["trusted": trusted])
+    case "playHaptic":
+      let style = (call.arguments as? [String: Any])?["style"] as? String ?? "pulse"
+      do {
+        try playHaptic(style: style)
+        lastAction = "Vibration: \(style)"
+        emitSnapshot(force: true)
+        result(nil)
+      } catch {
+        result(FlutterError(code: "haptics_unavailable", message: error.localizedDescription, details: nil))
+      }
+    case "stopHaptics":
+      stopHaptics()
+      lastAction = "Vibration stopped"
+      emitSnapshot(force: true)
+      result(nil)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private func loadState() {
+    let defaults = UserDefaults.standard
+    if defaults.object(forKey: enabledKey) != nil {
+      bridgeEnabled = defaults.bool(forKey: enabledKey)
+    }
+
+    if let raw = defaults.array(forKey: mappingsKey) {
+      let loaded = raw.compactMap { item -> BridgeMapping? in
+        guard let dictionary = item as? [String: Any] else {
+          return nil
+        }
+        return BridgeMapping(dictionary: dictionary)
+      }
+      if !loaded.isEmpty {
+        mappings = normalizeMappings(loaded)
+      }
+    }
+
+    if let dictionary = defaults.dictionary(forKey: settingsKey),
+      let loaded = BridgeSettings(dictionary: dictionary) {
+      settings = loaded
+    }
+  }
+
+  private func saveMappings() {
+    UserDefaults.standard.set(
+      mappings.map { $0.dictionary(includeNil: false) },
+      forKey: mappingsKey
+    )
+  }
+
+  private func saveSettings() {
+    UserDefaults.standard.set(settings.dictionary, forKey: settingsKey)
+  }
+
+  private func normalizeMappings(_ loaded: [BridgeMapping]) -> [BridgeMapping] {
+    BridgeMapping.defaults.map { fallback in
+      guard let existing = loaded.first(where: { $0.id == fallback.id }) else {
+        return fallback
+      }
+      if existing.id == "touchpad" && existing.action == .none && existing.label.isEmpty {
+        return fallback
+      }
+      return existing
+    }
+  }
+
+  private func snapshot() -> [String: Any] {
+    let controller = currentController
+    let vendorName = controller?.vendorName ?? "No controller"
+    let category = controller?.productCategory ?? "Unknown"
+    return [
+      "connected": controller != nil,
+      "controllerName": vendorName,
+      "productCategory": category,
+      "isDualSense": isDualSense,
+      "hapticsAvailable": hapticsAvailable,
+      "adaptiveTriggersAvailable": adaptiveTriggersAvailable,
+      "accessibilityTrusted": accessibilityTrusted(prompt: false),
+      "bridgeEnabled": bridgeEnabled,
+      "lastAction": lastAction,
+      "inputs": inputValues,
+      "mappings": mappings.map { $0.dictionary(includeNil: true) },
+      "settings": settings.dictionary,
+    ]
+  }
+
+  private func emitSnapshot(force: Bool = false) {
+    guard let eventSink else {
+      return
+    }
+    let now = Date()
+    if !force && now.timeIntervalSince(lastEmit) < 0.08 {
+      return
+    }
+    lastEmit = now
+    eventSink(snapshot())
+  }
+
+  private var isDualSense: Bool {
+    if #available(macOS 11.3, *) {
+      return currentController?.extendedGamepad is GCDualSenseGamepad
+    }
+    return false
+  }
+
+  private var hapticsAvailable: Bool {
+    guard #available(macOS 11.0, *) else {
+      return false
+    }
+    return currentController?.haptics != nil
+  }
+
+  private var adaptiveTriggersAvailable: Bool {
+    guard #available(macOS 11.3, *) else {
+      return false
+    }
+    return currentController?.extendedGamepad is GCDualSenseGamepad
+  }
+
+  private func accessibilityTrusted(prompt: Bool) -> Bool {
+    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt]
+    return AXIsProcessTrustedWithOptions(options as CFDictionary)
+  }
+
+  private func playHaptic(style: String) throws {
+    guard #available(macOS 11.0, *) else {
+      throw BridgeSenseError.hapticsUnavailable
+    }
+    guard let haptics = currentController?.haptics,
+      let engine = hapticEngine ?? haptics.createEngine(withLocality: .default) else {
+      throw BridgeSenseError.hapticsUnavailable
+    }
+
+    hapticEngine = engine
+    try engine.start()
+    try playPattern(style: style, engine: engine)
+    configureAdaptiveTriggers(style: style)
+  }
+
+  @available(macOS 11.0, *)
+  private func playPattern(style: String, engine: CHHapticEngine) throws {
+    let events: [CHHapticEvent]
+    switch style {
+    case "engine":
+      events = [
+        continuousEvent(intensity: 0.36, sharpness: 0.18, time: 0, duration: 1.4),
+        transientEvent(intensity: 0.5, sharpness: 0.2, time: 0.18),
+        transientEvent(intensity: 0.48, sharpness: 0.2, time: 0.42),
+        transientEvent(intensity: 0.54, sharpness: 0.24, time: 0.7),
+        transientEvent(intensity: 0.5, sharpness: 0.2, time: 1.0),
+      ]
+    case "gunshot":
+      events = [
+        transientEvent(intensity: 1.0, sharpness: 0.92, time: 0),
+        transientEvent(intensity: 0.5, sharpness: 0.35, time: 0.08),
+      ]
+    default:
+      events = [
+        transientEvent(intensity: 0.68, sharpness: 0.45, time: 0),
+      ]
+    }
+
+    let pattern = try CHHapticPattern(events: events, parameters: [])
+    let player = try engine.makePlayer(with: pattern)
+    try player.start(atTime: CHHapticTimeImmediate)
+  }
+
+  @available(macOS 11.0, *)
+  private func transientEvent(intensity: Float, sharpness: Float, time: TimeInterval) -> CHHapticEvent {
+    CHHapticEvent(
+      eventType: .hapticTransient,
+      parameters: [
+        CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
+        CHHapticEventParameter(parameterID: .hapticSharpness, value: sharpness),
+      ],
+      relativeTime: time
+    )
+  }
+
+  @available(macOS 11.0, *)
+  private func continuousEvent(
+    intensity: Float,
+    sharpness: Float,
+    time: TimeInterval,
+    duration: TimeInterval
+  ) -> CHHapticEvent {
+    CHHapticEvent(
+      eventType: .hapticContinuous,
+      parameters: [
+        CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
+        CHHapticEventParameter(parameterID: .hapticSharpness, value: sharpness),
+      ],
+      relativeTime: time,
+      duration: duration
+    )
+  }
+
+  private func stopHaptics() {
+    hapticEngine?.stop(completionHandler: nil)
+    hapticEngine = nil
+    resetAdaptiveTriggers()
+  }
+
+  private func configureAdaptiveTriggers(style: String) {
+    guard #available(macOS 11.3, *),
+      let dualSense = currentController?.extendedGamepad as? GCDualSenseGamepad else {
+      return
+    }
+
+    switch style {
+    case "engine":
+      dualSense.leftTrigger.setModeFeedbackWithStartPosition(0.12, resistiveStrength: 0.35)
+      dualSense.rightTrigger.setModeFeedbackWithStartPosition(0.12, resistiveStrength: 0.35)
+    case "gunshot":
+      dualSense.rightTrigger.setModeWeaponWithStartPosition(
+        0.18,
+        endPosition: 0.78,
+        resistiveStrength: 0.95
+      )
+    default:
+      dualSense.leftTrigger.setModeVibrationWithStartPosition(
+        0.12,
+        amplitude: 0.45,
+        frequency: 0.5
+      )
+      dualSense.rightTrigger.setModeVibrationWithStartPosition(
+        0.12,
+        amplitude: 0.45,
+        frequency: 0.5
+      )
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+      self?.resetAdaptiveTriggers()
+    }
+  }
+
+  private func resetAdaptiveTriggers() {
+    guard #available(macOS 11.3, *),
+      let dualSense = currentController?.extendedGamepad as? GCDualSenseGamepad else {
+      return
+    }
+    dualSense.leftTrigger.setModeOff()
+    dualSense.rightTrigger.setModeOff()
+  }
+}
+
+private enum BridgeSenseError: LocalizedError {
+  case hapticsUnavailable
+
+  var errorDescription: String? {
+    switch self {
+    case .hapticsUnavailable:
+      return "No controller haptics engine is available."
+    }
+  }
+}
+
+private enum BridgeAction: String {
+  case none
+  case cursor
+  case scroll
+  case key
+  case mouseClick
+  case haptic
+}
+
+private enum MouseButton: String {
+  case left
+  case right
+
+  var cgButton: CGMouseButton {
+    switch self {
+    case .left:
+      return .left
+    case .right:
+      return .right
+    }
+  }
+
+  var downEvent: CGEventType {
+    switch self {
+    case .left:
+      return .leftMouseDown
+    case .right:
+      return .rightMouseDown
+    }
+  }
+
+  var upEvent: CGEventType {
+    switch self {
+    case .left:
+      return .leftMouseUp
+    case .right:
+      return .rightMouseUp
+    }
+  }
+
+  var actionDescription: String {
+    switch self {
+    case .left:
+      return "left click"
+    case .right:
+      return "right click"
+    }
+  }
+}
+
+private struct BridgeSettings {
+  static let defaults = BridgeSettings(pointerSpeed: 22, scrollSpeed: 14, deadZone: 0.12)
+
+  let pointerSpeed: Double
+  let scrollSpeed: Double
+  let deadZone: Double
+
+  init(pointerSpeed: Double, scrollSpeed: Double, deadZone: Double) {
+    self.pointerSpeed = min(max(pointerSpeed, 4), 56)
+    self.scrollSpeed = min(max(scrollSpeed, 2), 36)
+    self.deadZone = min(max(deadZone, 0.03), 0.35)
+  }
+
+  init?(dictionary: [String: Any]?) {
+    guard let dictionary else {
+      return nil
+    }
+    self.init(
+      pointerSpeed: BridgeSettings.doubleValue(dictionary["pointerSpeed"], fallback: 22),
+      scrollSpeed: BridgeSettings.doubleValue(dictionary["scrollSpeed"], fallback: 14),
+      deadZone: BridgeSettings.doubleValue(dictionary["deadZone"], fallback: 0.12)
+    )
+  }
+
+  var dictionary: [String: Any] {
+    [
+      "pointerSpeed": pointerSpeed,
+      "scrollSpeed": scrollSpeed,
+      "deadZone": deadZone,
+    ]
+  }
+
+  private static func doubleValue(_ value: Any?, fallback: Double) -> Double {
+    if let value = value as? Double {
+      return value
+    }
+    if let value = value as? NSNumber {
+      return value.doubleValue
+    }
+    return fallback
+  }
+}
+
+private struct BridgeMapping {
+  static let defaults: [BridgeMapping] = [
+    BridgeMapping(id: "leftStick", controlLabel: "L stick", action: .cursor, label: "Cursor"),
+    BridgeMapping(id: "rightStick", controlLabel: "R stick", action: .scroll, label: "Scroll"),
+    BridgeMapping(id: "touchpadMotion", controlLabel: "Touchpad move", action: .cursor, label: "Mouse move"),
+    BridgeMapping(id: "l2", controlLabel: "L2"),
+    BridgeMapping(id: "r2", controlLabel: "R2"),
+    BridgeMapping(id: "l1", controlLabel: "L1"),
+    BridgeMapping(id: "r1", controlLabel: "R1"),
+    BridgeMapping(id: "cross", controlLabel: "Cross / A"),
+    BridgeMapping(id: "circle", controlLabel: "Circle / B"),
+    BridgeMapping(id: "square", controlLabel: "Square / X"),
+    BridgeMapping(id: "triangle", controlLabel: "Triangle / Y"),
+    BridgeMapping(id: "dpadUp", controlLabel: "D-pad up"),
+    BridgeMapping(id: "dpadDown", controlLabel: "D-pad down"),
+    BridgeMapping(id: "dpadLeft", controlLabel: "D-pad left"),
+    BridgeMapping(id: "dpadRight", controlLabel: "D-pad right"),
+    BridgeMapping(id: "leftStickButton", controlLabel: "L3"),
+    BridgeMapping(id: "rightStickButton", controlLabel: "R3"),
+    BridgeMapping(id: "menu", controlLabel: "Menu"),
+    BridgeMapping(id: "options", controlLabel: "Options"),
+    BridgeMapping(id: "home", controlLabel: "PS / Home"),
+    BridgeMapping(id: "touchpad", controlLabel: "Touchpad click"),
+  ]
+
+  let id: String
+  let controlLabel: String
+  let action: BridgeAction
+  let label: String
+  let keyCode: UInt16?
+  let keyLabel: String
+  let mouseButton: MouseButton
+  let modifiers: [String]
+  let vibrate: Bool
+  let hapticStyle: String
+
+  init(
+    id: String,
+    controlLabel: String,
+    action: BridgeAction = .none,
+    label: String = "",
+    keyCode: UInt16? = nil,
+    keyLabel: String = "",
+    mouseButton: MouseButton = .left,
+    modifiers: [String] = [],
+    vibrate: Bool = false,
+    hapticStyle: String = "pulse"
+  ) {
+    self.id = id
+    self.controlLabel = controlLabel
+    self.action = action
+    self.label = label
+    self.keyCode = keyCode
+    self.keyLabel = keyLabel
+    self.mouseButton = mouseButton
+    self.modifiers = modifiers
+    self.vibrate = vibrate
+    self.hapticStyle = hapticStyle
+  }
+
+  init?(dictionary: [String: Any]) {
+    guard let id = dictionary["id"] as? String,
+      let fallback = BridgeMapping.defaults.first(where: { $0.id == id }) else {
+      return nil
+    }
+
+    let rawAction = dictionary["action"] as? String ?? fallback.action.rawValue
+    var action = BridgeAction(rawValue: rawAction) ?? fallback.action
+    let vibrate = (dictionary["vibrate"] as? Bool ?? fallback.vibrate) || action == .haptic
+    if action == .haptic {
+      action = .none
+    }
+    let keyCode: UInt16?
+    if let number = dictionary["keyCode"] as? NSNumber {
+      keyCode = number.uint16Value
+    } else if let int = dictionary["keyCode"] as? Int {
+      keyCode = UInt16(int)
+    } else {
+      keyCode = fallback.keyCode
+    }
+
+    self.init(
+      id: id,
+      controlLabel: dictionary["controlLabel"] as? String ?? fallback.controlLabel,
+      action: action,
+      label: dictionary["label"] as? String ?? fallback.label,
+      keyCode: keyCode,
+      keyLabel: dictionary["keyLabel"] as? String ?? fallback.keyLabel,
+      mouseButton: MouseButton(rawValue: dictionary["mouseButton"] as? String ?? "") ?? fallback.mouseButton,
+      modifiers: dictionary["modifiers"] as? [String] ?? fallback.modifiers,
+      vibrate: vibrate,
+      hapticStyle: dictionary["hapticStyle"] as? String ?? fallback.hapticStyle
+    )
+  }
+
+  func dictionary(includeNil: Bool) -> [String: Any] {
+    var dictionary: [String: Any] = [
+      "id": id,
+      "controlLabel": controlLabel,
+      "action": action.rawValue,
+      "label": label,
+      "keyLabel": keyLabel,
+      "mouseButton": mouseButton.rawValue,
+      "modifiers": modifiers,
+      "vibrate": vibrate,
+      "hapticStyle": hapticStyle,
+    ]
+    if let keyCode {
+      dictionary["keyCode"] = Int(keyCode)
+    } else if includeNil {
+      dictionary["keyCode"] = NSNull()
+    }
+    return dictionary
+  }
+}

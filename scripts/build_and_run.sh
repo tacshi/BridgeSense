@@ -2,8 +2,8 @@
 set -euo pipefail
 
 MODE="${1:-run}"
-APP_NAME="bridge_sense"
-APP_BUNDLE="build/macos/Build/Products/Debug/bridge_sense.app"
+APP_NAME="BridgeSense"
+APP_BUNDLE="build/macos/Build/Products/Debug/BridgeSense.app"
 BUNDLE_ID="com.example.bridgeSense"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

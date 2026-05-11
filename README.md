@@ -1,35 +1,44 @@
+<p align="center">
+  <img src="assets/app_icon/bridgesense_icon_1024.png" alt="BridgeSense icon" width="120">
+</p>
+
 # BridgeSense
 
-BridgeSense is a macOS Flutter utility that maps a DualSense or compatible
-extended game controller to desktop input, including mouse movement, scrolling,
-keyboard shortcuts, mouse clicks, haptics, adaptive triggers, and menu bar
-background operation.
+BridgeSense is a macOS utility for using a DualSense controller as a desktop
+input device. It maps controller input to pointer movement, scrolling, keyboard
+shortcuts, mouse clicks, haptics, and DualSense adaptive triggers while staying
+available from the menu bar when the main window is closed.
 
-## Current bridge
+## Features
 
-- L stick moves the pointer.
-- R stick scrolls the view under the pointer.
-- DualSense touchpad movement moves the pointer.
-- Button bindings default to `Off`.
-- Common DualSense controls can be remapped to keyboard keys or mouse click.
-- Vibration is a secondary effect that can be enabled per button binding.
-- Controller haptics are exposed as `Drive`, `Shoot`, and `Pulse` patterns.
-- DualSense adaptive triggers are used when macOS reports the controller as a
-  `GCDualSenseGamepad`.
-- Closing the window keeps BridgeSense running from its menu bar status item.
-- The macOS app icon is generated from the checked-in app icon source at
-  `assets/app_icon/bridgesense_icon_1024.png`.
+- Left stick pointer control.
+- Right stick scrolling.
+- DualSense touchpad pointer control.
+- Remappable buttons for keyboard shortcuts and mouse clicks.
+- Optional per-button vibration using `Drive`, `Shoot`, and `Pulse` haptic
+  patterns.
+- DualSense adaptive trigger effects for vibration-enabled L2/R2 trigger
+  bindings.
+- Menu bar background operation after closing the main window.
 
 ## Permissions
 
-macOS must trust the app for Accessibility before global pointer, scroll, and
-keyboard events can reach other apps. Use the `Request` button in BridgeSense,
-then enable the app in System Settings if macOS opens the permission pane.
+BridgeSense needs macOS Accessibility permission before it can post global
+pointer, scroll, keyboard, and mouse-click events to other apps. Use the
+`Request` button in BridgeSense, then enable `BridgeSense.app` in System
+Settings when prompted.
 
-The macOS sandbox entitlement is disabled for this utility because the app posts
-global input events through Quartz.
+If `Output` still shows `Blocked` after granting permission, quit every running
+BridgeSense copy, remove the stale Accessibility entry, run
+`./scripts/build_and_run.sh`, press `Request`, and enable the new
+`BridgeSense.app` row.
 
-## Run
+The macOS sandbox is disabled because BridgeSense posts global input events
+through Quartz.
+
+## Development
+
+Run the debug app:
 
 ```bash
 ./scripts/build_and_run.sh
@@ -42,7 +51,7 @@ Useful variants:
 ./scripts/build_and_run.sh --logs
 ```
 
-## Verify
+Verify changes:
 
 ```bash
 flutter analyze
@@ -52,13 +61,11 @@ flutter build macos --debug
 
 ## Release
 
-`scripts/releash.sh` builds a release macOS app, signs it with the
-`DEVELOPER_ID_APPLICATION` identity, creates a root-level DMG, notarizes it with
-Apple, staples the ticket, validates Gatekeeper acceptance, and uploads the DMG
-to GitHub Releases.
+`scripts/releash.sh` builds the release app, signs it, creates a DMG, notarizes
+and staples it, validates Gatekeeper acceptance, and uploads the DMG to GitHub
+Releases.
 
-The script uses the saved notarytool keychain profile `BridgeSense` by default.
-Create that profile outside the repo before releasing:
+Create the notarytool keychain profile once:
 
 ```bash
 xcrun notarytool store-credentials BridgeSense \
@@ -67,7 +74,7 @@ xcrun notarytool store-credentials BridgeSense \
   --password "<app-specific-password>"
 ```
 
-The GitHub CLI must be authenticated for this repo:
+The GitHub CLI must also be authenticated:
 
 ```bash
 gh auth status
@@ -80,5 +87,5 @@ DEVELOPER_ID_APPLICATION="Developer ID Application: Example Name (TEAMID)" \
   ./scripts/releash.sh 1.0.1
 ```
 
-The output is written to the project root as `BridgeSense-<version>.dmg` and
-published to the `v<version>` GitHub Release.
+The release artifact is written to the project root as
+`BridgeSense-<version>.dmg` and published to the `v<version>` GitHub Release.

@@ -187,6 +187,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       let value = buttonValues[mapping.id] ?? 0
       let pressed = value >= buttonThreshold
       let wasPressed = previousPressed[mapping.id] ?? false
+      applyAdaptiveTriggerMapping(mapping, pressed: pressed, wasPressed: wasPressed)
       if pressed && !wasPressed {
         perform(mapping: mapping)
       }
@@ -196,6 +197,53 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
 
   private func isContinuousMapping(_ id: String) -> Bool {
     id == "leftStick" || id == "rightStick" || id == "touchpadMotion"
+  }
+
+  private func applyAdaptiveTriggerMapping(
+    _ mapping: BridgeMapping,
+    pressed: Bool,
+    wasPressed: Bool
+  ) {
+    guard let side = adaptiveTriggerSide(for: mapping.id) else {
+      return
+    }
+    guard mapping.vibrate else {
+      if pressed != wasPressed, !pressed {
+        resetAdaptiveTriggers(sides: side)
+      }
+      return
+    }
+    guard pressed != wasPressed else {
+      return
+    }
+
+    if pressed {
+      configureAdaptiveTriggers(
+        style: adaptiveTriggerStyle(for: mapping),
+        sides: side,
+        resetAfterDelay: false
+      )
+    } else {
+      resetAdaptiveTriggers(sides: side)
+    }
+  }
+
+  private func adaptiveTriggerSide(for id: String) -> DualSenseTriggerSides? {
+    switch id {
+    case "l2":
+      return .left
+    case "r2":
+      return .right
+    default:
+      return nil
+    }
+  }
+
+  private func adaptiveTriggerStyle(for mapping: BridgeMapping) -> String {
+    if mapping.hapticStyle != "pulse" {
+      return mapping.hapticStyle
+    }
+    return mapping.id == "r2" ? "gunshot" : "engine"
   }
 
   private func applyTouchpadMapping(_ mapping: BridgeMapping) {
@@ -545,6 +593,10 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       result(snapshot())
     case "setBridgeEnabled":
       bridgeEnabled = (call.arguments as? Bool) ?? true
+      if !bridgeEnabled {
+        resetAdaptiveTriggers()
+        previousPressed.removeAll()
+      }
       UserDefaults.standard.set(bridgeEnabled, forKey: enabledKey)
       emitSnapshot(force: true)
       result(nil)
@@ -554,6 +606,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
         return
       }
       mappings = normalizeMappings(rawMappings.compactMap(BridgeMapping.init(dictionary:)))
+      resetDisabledAdaptiveTriggers()
       saveMappings()
       emitSnapshot(force: true)
       result(nil)
@@ -564,6 +617,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       result(nil)
     case "resetMappings":
       mappings = BridgeMapping.defaults
+      resetAdaptiveTriggers()
       saveMappings()
       emitSnapshot(force: true)
       result(snapshot())
@@ -673,9 +727,11 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
 
   private var isDualSense: Bool {
     if #available(macOS 11.3, *) {
-      return currentController?.extendedGamepad is GCDualSenseGamepad
+      if currentController?.extendedGamepad is GCDualSenseGamepad {
+        return true
+      }
     }
-    return false
+    return rawTouchpadReader.hasDualSenseDevice
   }
 
   private var hapticsAvailable: Bool {
@@ -686,6 +742,9 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   private var adaptiveTriggersAvailable: Bool {
+    if rawTouchpadReader.hasDualSenseDevice {
+      return true
+    }
     guard #available(macOS 11.3, *) else {
       return false
     }
@@ -709,7 +768,6 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     hapticEngine = engine
     try engine.start()
     try playPattern(style: style, engine: engine)
-    configureAdaptiveTriggers(style: style)
   }
 
   @available(macOS 11.0, *)
@@ -776,47 +834,100 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     resetAdaptiveTriggers()
   }
 
-  private func configureAdaptiveTriggers(style: String) {
-    guard #available(macOS 11.3, *),
-      let dualSense = currentController?.extendedGamepad as? GCDualSenseGamepad else {
+  private func configureAdaptiveTriggers(
+    style: String,
+    sides requestedSides: DualSenseTriggerSides? = nil,
+    resetAfterDelay: Bool = true
+  ) {
+    let effect = DualSenseAdaptiveTriggerEffect.effect(
+      forHapticStyle: style,
+      sides: requestedSides
+    )
+    rawTouchpadReader.setAdaptiveTriggers(effect)
+
+    if #available(macOS 11.3, *),
+      let dualSense = currentController?.extendedGamepad as? GCDualSenseGamepad {
+      configureGameControllerAdaptiveTriggers(
+        dualSense,
+        style: style,
+        sides: effect.sides
+      )
+    }
+
+    guard resetAfterDelay else {
       return
     }
-
-    switch style {
-    case "engine":
-      dualSense.leftTrigger.setModeFeedbackWithStartPosition(0.12, resistiveStrength: 0.35)
-      dualSense.rightTrigger.setModeFeedbackWithStartPosition(0.12, resistiveStrength: 0.35)
-    case "gunshot":
-      dualSense.rightTrigger.setModeWeaponWithStartPosition(
-        0.18,
-        endPosition: 0.78,
-        resistiveStrength: 0.95
-      )
-    default:
-      dualSense.leftTrigger.setModeVibrationWithStartPosition(
-        0.12,
-        amplitude: 0.45,
-        frequency: 0.5
-      )
-      dualSense.rightTrigger.setModeVibrationWithStartPosition(
-        0.12,
-        amplitude: 0.45,
-        frequency: 0.5
-      )
-    }
-
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-      self?.resetAdaptiveTriggers()
+      self?.resetAdaptiveTriggers(sides: effect.sides)
     }
   }
 
-  private func resetAdaptiveTriggers() {
+  @available(macOS 11.3, *)
+  private func configureGameControllerAdaptiveTriggers(
+    _ dualSense: GCDualSenseGamepad,
+    style: String,
+    sides: DualSenseTriggerSides
+  ) {
+    if sides.contains(.left) {
+      switch style {
+      case "engine":
+        dualSense.leftTrigger.setModeFeedbackWithStartPosition(0.12, resistiveStrength: 0.35)
+      case "gunshot":
+        dualSense.leftTrigger.setModeWeaponWithStartPosition(
+          0.18,
+          endPosition: 0.78,
+          resistiveStrength: 0.95
+        )
+      default:
+        dualSense.leftTrigger.setModeVibrationWithStartPosition(
+          0.12,
+          amplitude: 0.45,
+          frequency: 0.5
+        )
+      }
+    }
+
+    if sides.contains(.right) {
+      switch style {
+      case "engine":
+        dualSense.rightTrigger.setModeFeedbackWithStartPosition(0.12, resistiveStrength: 0.35)
+      case "gunshot":
+        dualSense.rightTrigger.setModeWeaponWithStartPosition(
+          0.18,
+          endPosition: 0.78,
+          resistiveStrength: 0.95
+        )
+      default:
+        dualSense.rightTrigger.setModeVibrationWithStartPosition(
+          0.12,
+          amplitude: 0.45,
+          frequency: 0.5
+        )
+      }
+    }
+  }
+
+  private func resetAdaptiveTriggers(sides: DualSenseTriggerSides = .both) {
+    rawTouchpadReader.setAdaptiveTriggers(.off(sides: sides))
     guard #available(macOS 11.3, *),
       let dualSense = currentController?.extendedGamepad as? GCDualSenseGamepad else {
       return
     }
-    dualSense.leftTrigger.setModeOff()
-    dualSense.rightTrigger.setModeOff()
+    if sides.contains(.left) {
+      dualSense.leftTrigger.setModeOff()
+    }
+    if sides.contains(.right) {
+      dualSense.rightTrigger.setModeOff()
+    }
+  }
+
+  private func resetDisabledAdaptiveTriggers() {
+    for mapping in mappings where !mapping.vibrate {
+      guard let side = adaptiveTriggerSide(for: mapping.id) else {
+        continue
+      }
+      resetAdaptiveTriggers(sides: side)
+    }
   }
 }
 
@@ -825,14 +936,29 @@ private final class RawDualSenseTouchpadReader {
   private static let productIDs = [0x0ce6, 0x0df2]
   private static let touchpadWidth = 1920.0
   private static let touchpadHeight = 1080.0
+  private static let outputReportIDUSB = 0x02
+  private static let outputReportIDBluetooth = 0x31
+  private static let outputReportSizeUSB = 48
+  private static let outputReportSizeBluetooth = 78
+  private static let outputReportTagBluetooth: UInt8 = 0x10
+  private static let outputReportCRCSeed: UInt8 = 0xa2
 
   var onSample: ((TouchpadSample) -> Void)?
+  var hasDualSenseDevice: Bool {
+    devicesLock.lock()
+    defer { devicesLock.unlock() }
+    return !devices.isEmpty
+  }
 
   private var manager: IOHIDManager?
   private var devices: [String: DeviceRegistration] = [:]
   private let devicesLock = NSLock()
   private let pollQueue = DispatchQueue(
     label: "BridgeSense.RawDualSenseTouchpadReader.poll",
+    qos: .userInitiated
+  )
+  private let outputQueue = DispatchQueue(
+    label: "BridgeSense.RawDualSenseTouchpadReader.output",
     qos: .userInitiated
   )
   private var pollTimer: DispatchSourceTimer?
@@ -923,6 +1049,38 @@ private final class RawDualSenseTouchpadReader {
     )
     IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
     self.manager = nil
+  }
+
+  func setAdaptiveTriggers(_ effect: DualSenseAdaptiveTriggerEffect) {
+    guard let target = outputTarget() else {
+      return
+    }
+
+    outputQueue.async {
+      let report = Self.outputReport(
+        effect: effect,
+        isBluetooth: target.isBluetooth,
+        sequence: target.sequence
+      )
+      let reportID = target.isBluetooth
+        ? Self.outputReportIDBluetooth
+        : Self.outputReportIDUSB
+      let result = report.withUnsafeBufferPointer { buffer -> IOReturn in
+        guard let baseAddress = buffer.baseAddress else {
+          return kIOReturnBadArgument
+        }
+        return IOHIDDeviceSetReport(
+          target.device,
+          kIOHIDReportTypeOutput,
+          CFIndex(reportID),
+          baseAddress,
+          report.count
+        )
+      }
+      if result != kIOReturnSuccess {
+        NSLog("BridgeSense: failed to send DualSense adaptive trigger report: 0x%08x", result)
+      }
+    }
   }
 
   private func register(device: IOHIDDevice) {
@@ -1070,6 +1228,92 @@ private final class RawDualSenseTouchpadReader {
     timer?.cancel()
   }
 
+  private func outputTarget() -> OutputTarget? {
+    devicesLock.lock()
+    defer { devicesLock.unlock() }
+
+    let registration = devices.values.first {
+      outputReportLength(for: $0.device) >= Self.outputReportSizeUSB
+    } ?? devices.values.first
+    guard let registration else {
+      return nil
+    }
+
+    let sequence = registration.outputSequence
+    registration.outputSequence = (registration.outputSequence + 1) & 0x0f
+    return OutputTarget(
+      device: registration.device,
+      isBluetooth: isBluetooth(device: registration.device),
+      sequence: sequence
+    )
+  }
+
+  private static func outputReport(
+    effect: DualSenseAdaptiveTriggerEffect,
+    isBluetooth: Bool,
+    sequence: UInt8
+  ) -> [UInt8] {
+    let reportSize = isBluetooth ? outputReportSizeBluetooth : outputReportSizeUSB
+    var report = [UInt8](repeating: 0, count: reportSize)
+    let commonOffset: Int
+
+    if isBluetooth {
+      report[0] = UInt8(outputReportIDBluetooth)
+      report[1] = (sequence & 0x0f) << 4
+      report[2] = outputReportTagBluetooth
+      commonOffset = 3
+    } else {
+      report[0] = UInt8(outputReportIDUSB)
+      commonOffset = 1
+    }
+
+    report[commonOffset] = effect.sides.validFlag
+
+    if effect.sides.contains(.right) {
+      write(effect.bytes, to: &report, offset: commonOffset + 10)
+    }
+    if effect.sides.contains(.left) {
+      write(effect.bytes, to: &report, offset: commonOffset + 21)
+    }
+
+    if isBluetooth {
+      let crc = crc32(seed: outputReportCRCSeed, bytes: report, length: reportSize - 4)
+      report[reportSize - 4] = UInt8(crc & 0xff)
+      report[reportSize - 3] = UInt8((crc >> 8) & 0xff)
+      report[reportSize - 2] = UInt8((crc >> 16) & 0xff)
+      report[reportSize - 1] = UInt8((crc >> 24) & 0xff)
+    }
+
+    return report
+  }
+
+  private static func write(_ bytes: [UInt8], to report: inout [UInt8], offset: Int) {
+    for (index, byte) in bytes.enumerated() where offset + index < report.count {
+      report[offset + index] = byte
+    }
+  }
+
+  private static func crc32(seed: UInt8, bytes: [UInt8], length: Int) -> UInt32 {
+    var crc: UInt32 = 0xffff_ffff
+    crc = crc32(crc, byte: seed)
+    for index in 0..<length {
+      crc = crc32(crc, byte: bytes[index])
+    }
+    return ~crc
+  }
+
+  private static func crc32(_ crc: UInt32, byte: UInt8) -> UInt32 {
+    var value = crc ^ UInt32(byte)
+    for _ in 0..<8 {
+      if value & 1 == 1 {
+        value = (value >> 1) ^ 0xedb8_8320
+      } else {
+        value >>= 1
+      }
+    }
+    return value
+  }
+
   private func copyFullReportSample(
     device: IOHIDDevice,
     reportID: CFIndex,
@@ -1171,6 +1415,16 @@ private final class RawDualSenseTouchpadReader {
     return (value as? NSNumber)?.intValue ?? 128
   }
 
+  private func outputReportLength(for device: IOHIDDevice) -> Int {
+    let value = IOHIDDeviceGetProperty(device, kIOHIDMaxOutputReportSizeKey as CFString)
+    return (value as? NSNumber)?.intValue ?? 0
+  }
+
+  private func isBluetooth(device: IOHIDDevice) -> Bool {
+    let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String
+    return transport?.localizedCaseInsensitiveContains("Bluetooth") == true
+  }
+
   private func isDualSense(device: IOHIDDevice) -> Bool {
     if let productID = IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? NSNumber,
       Self.productIDs.contains(productID.intValue) {
@@ -1185,10 +1439,27 @@ private final class RawDualSenseTouchpadReader {
     String(describing: Unmanaged.passUnretained(device).toOpaque())
   }
 
-  private struct DeviceRegistration {
+  private struct OutputTarget {
+    let device: IOHIDDevice
+    let isBluetooth: Bool
+    let sequence: UInt8
+  }
+
+  private final class DeviceRegistration {
     let device: IOHIDDevice
     let reportBuffer: UnsafeMutablePointer<UInt8>
     let reportLength: Int
+    var outputSequence: UInt8 = 0
+
+    init(
+      device: IOHIDDevice,
+      reportBuffer: UnsafeMutablePointer<UInt8>,
+      reportLength: Int
+    ) {
+      self.device = device
+      self.reportBuffer = reportBuffer
+      self.reportLength = reportLength
+    }
   }
 
   private static let deviceMatchedCallback: IOHIDDeviceCallback = {
@@ -1249,6 +1520,174 @@ private struct TouchpadSample {
 
   static func inactive(button: Double) -> TouchpadSample {
     TouchpadSample(point: .zero, button: button, active: false)
+  }
+}
+
+private struct DualSenseTriggerSides: OptionSet {
+  let rawValue: UInt8
+
+  static let right = DualSenseTriggerSides(rawValue: 1 << 0)
+  static let left = DualSenseTriggerSides(rawValue: 1 << 1)
+  static let both: DualSenseTriggerSides = [.right, .left]
+
+  var validFlag: UInt8 {
+    var flag: UInt8 = 0
+    if contains(.right) {
+      flag |= 1 << 2
+    }
+    if contains(.left) {
+      flag |= 1 << 3
+    }
+    return flag
+  }
+}
+
+private struct DualSenseAdaptiveTriggerEffect {
+  private static let modeOff: UInt8 = 0x05
+  private static let modeFeedback: UInt8 = 0x21
+  private static let modeWeapon: UInt8 = 0x25
+  private static let modeVibration: UInt8 = 0x26
+
+  let sides: DualSenseTriggerSides
+  let bytes: [UInt8]
+
+  static func effect(
+    forHapticStyle style: String,
+    sides requestedSides: DualSenseTriggerSides? = nil
+  ) -> DualSenseAdaptiveTriggerEffect {
+    switch style {
+    case "engine":
+      return .feedback(
+        sides: requestedSides ?? .both,
+        startPosition: 0.12,
+        resistiveStrength: 0.35
+      )
+    case "gunshot":
+      return .weapon(
+        sides: requestedSides ?? .right,
+        startPosition: 0.18,
+        endPosition: 0.78,
+        resistiveStrength: 0.95
+      )
+    default:
+      return .vibration(
+        sides: requestedSides ?? .both,
+        startPosition: 0.12,
+        amplitude: 0.45,
+        frequency: 0.5
+      )
+    }
+  }
+
+  static func off(sides: DualSenseTriggerSides) -> DualSenseAdaptiveTriggerEffect {
+    DualSenseAdaptiveTriggerEffect(
+      sides: sides,
+      bytes: [modeOff] + [UInt8](repeating: 0, count: 10)
+    )
+  }
+
+  static func feedback(
+    sides: DualSenseTriggerSides,
+    startPosition: Float,
+    resistiveStrength: Float
+  ) -> DualSenseAdaptiveTriggerEffect {
+    let position = normalizedPosition(startPosition)
+    let strength = normalizedStrength(resistiveStrength)
+    guard strength > 0 else {
+      return .off(sides: sides)
+    }
+    return DualSenseAdaptiveTriggerEffect(
+      sides: sides,
+      bytes: [modeFeedback] + bitpackedZones(from: position, strength: strength, frequency: 0)
+    )
+  }
+
+  static func weapon(
+    sides: DualSenseTriggerSides,
+    startPosition: Float,
+    endPosition: Float,
+    resistiveStrength: Float
+  ) -> DualSenseAdaptiveTriggerEffect {
+    let start = min(max(normalizedPosition(startPosition), 2), 7)
+    let end = min(max(normalizedPosition(endPosition), start + 1), 8)
+    let strength = normalizedStrength(resistiveStrength)
+    guard strength > 0 else {
+      return .off(sides: sides)
+    }
+
+    let zones = UInt16(1 << start) | UInt16(1 << end)
+    let params: [UInt8] = [
+      UInt8(zones & 0xff),
+      UInt8((zones >> 8) & 0xff),
+      UInt8(strength - 1),
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+    ]
+    return DualSenseAdaptiveTriggerEffect(sides: sides, bytes: [modeWeapon] + params)
+  }
+
+  static func vibration(
+    sides: DualSenseTriggerSides,
+    startPosition: Float,
+    amplitude: Float,
+    frequency: Float
+  ) -> DualSenseAdaptiveTriggerEffect {
+    let position = normalizedPosition(startPosition)
+    let strength = normalizedStrength(amplitude)
+    let rawFrequency = normalizedFrequency(frequency)
+    guard strength > 0, rawFrequency > 0 else {
+      return .off(sides: sides)
+    }
+    return DualSenseAdaptiveTriggerEffect(
+      sides: sides,
+      bytes: [modeVibration]
+        + bitpackedZones(from: position, strength: strength, frequency: rawFrequency)
+    )
+  }
+
+  private static func bitpackedZones(
+    from position: Int,
+    strength: Int,
+    frequency: Int
+  ) -> [UInt8] {
+    var activeZones: UInt16 = 0
+    var strengthZones: UInt32 = 0
+    let strengthValue = UInt32((strength - 1) & 0x07)
+
+    for index in position..<10 {
+      activeZones |= UInt16(1 << index)
+      strengthZones |= strengthValue << (3 * index)
+    }
+
+    return [
+      UInt8(activeZones & 0xff),
+      UInt8((activeZones >> 8) & 0xff),
+      UInt8(strengthZones & 0xff),
+      UInt8((strengthZones >> 8) & 0xff),
+      UInt8((strengthZones >> 16) & 0xff),
+      UInt8((strengthZones >> 24) & 0xff),
+      0,
+      0,
+      UInt8(frequency),
+      0,
+    ]
+  }
+
+  private static func normalizedPosition(_ value: Float) -> Int {
+    min(max(Int((value * 9).rounded()), 0), 9)
+  }
+
+  private static func normalizedStrength(_ value: Float) -> Int {
+    min(max(Int((value * 8).rounded()), 0), 8)
+  }
+
+  private static func normalizedFrequency(_ value: Float) -> Int {
+    min(max(Int((value * 255).rounded()), 0), 255)
   }
 }
 

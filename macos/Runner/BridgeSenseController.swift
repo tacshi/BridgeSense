@@ -12,14 +12,17 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   private let settingsKey = "BridgeSenseSettingsV1"
   private let enabledKey = "BridgeSenseEnabledV1"
   private let buttonThreshold = 0.55
+  private let accessibilityRefreshInterval = 1.0
 
   private var methodChannel: FlutterMethodChannel?
   private var eventChannel: FlutterEventChannel?
   private var eventSink: FlutterEventSink?
   private var pollTimer: Timer?
+  private var accessibilityTimer: Timer?
   private var currentController: GCController?
   private var previousPressed: [String: Bool] = [:]
   private var inputValues: [String: Double] = [:]
+  private var accessibilityTrustedState = false
   private var lastAction = ""
   private var lastEmit = Date.distantPast
   private var hapticEngine: CHHapticEngine?
@@ -37,8 +40,10 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       self?.handleRawTouchpadSample(sample)
     }
     loadState()
+    accessibilityTrustedState = readAccessibilityTrusted(prompt: false)
     observeControllers()
     rawTouchpadReader.start()
+    startAccessibilityMonitoring()
     startPolling()
   }
 
@@ -63,6 +68,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     eventSink events: @escaping FlutterEventSink
   ) -> FlutterError? {
     eventSink = events
+    refreshAccessibilityTrust(emitOnChange: false)
     emitSnapshot(force: true)
     return nil
   }
@@ -131,6 +137,17 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     RunLoop.main.add(pollTimer!, forMode: .common)
   }
 
+  private func startAccessibilityMonitoring() {
+    accessibilityTimer?.invalidate()
+    accessibilityTimer = Timer.scheduledTimer(
+      withTimeInterval: accessibilityRefreshInterval,
+      repeats: true
+    ) { [weak self] _ in
+      self?.refreshAccessibilityTrust()
+    }
+    RunLoop.main.add(accessibilityTimer!, forMode: .common)
+  }
+
   private func poll() {
     guard currentController?.extendedGamepad != nil else {
       emitSnapshot()
@@ -148,7 +165,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   private func applyContinuousMappings() {
-    guard accessibilityTrusted(prompt: false) else {
+    guard accessibilityTrustedState else {
       return
     }
 
@@ -192,6 +209,18 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
         perform(mapping: mapping)
       }
       previousPressed[mapping.id] = pressed
+    }
+  }
+
+  private func syncPreviousPressedWithCurrentInputs() {
+    guard currentController?.extendedGamepad != nil else {
+      previousPressed.removeAll()
+      return
+    }
+
+    inputValues = readInputs()
+    for mapping in mappings where !isContinuousMapping(mapping.id) {
+      previousPressed[mapping.id] = (inputValues[mapping.id] ?? 0) >= buttonThreshold
     }
   }
 
@@ -305,7 +334,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     inputValues["touchpadActive"] = sample.active ? 1 : 0
 
     guard bridgeEnabled,
-      accessibilityTrusted(prompt: false),
+      accessibilityTrustedState,
       let mapping = mappings.first(where: { $0.id == "touchpadMotion" }) else {
       emitSnapshot()
       return
@@ -320,7 +349,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
 
     switch mapping.action {
     case .key:
-      guard accessibilityTrusted(prompt: false) else {
+      guard accessibilityTrustedState else {
         actionDescription = "Accessibility permission required"
         break
       }
@@ -331,7 +360,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       let purpose = mapping.label.isEmpty ? mapping.controlLabel : mapping.label
       actionDescription = "\(mapping.controlLabel): \(purpose) -> \(mapping.keyLabel)"
     case .mouseClick:
-      guard accessibilityTrusted(prompt: false) else {
+      guard accessibilityTrustedState else {
         actionDescription = "Accessibility permission required"
         break
       }
@@ -590,6 +619,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   private func handle(call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "getSnapshot":
+      refreshAccessibilityTrust()
       result(snapshot())
     case "setBridgeEnabled":
       bridgeEnabled = (call.arguments as? Bool) ?? true
@@ -622,7 +652,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       emitSnapshot(force: true)
       result(snapshot())
     case "requestAccessibility":
-      let trusted = accessibilityTrusted(prompt: true)
+      let trusted = refreshAccessibilityTrust(prompt: true, emitOnChange: false)
       lastAction = trusted ? "Accessibility trusted" : "Accessibility requested"
       emitSnapshot(force: true)
       result(["trusted": trusted])
@@ -704,7 +734,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       "isDualSense": isDualSense,
       "hapticsAvailable": hapticsAvailable,
       "adaptiveTriggersAvailable": adaptiveTriggersAvailable,
-      "accessibilityTrusted": accessibilityTrusted(prompt: false),
+      "accessibilityTrusted": accessibilityTrustedState,
       "bridgeEnabled": bridgeEnabled,
       "lastAction": lastAction,
       "inputs": inputValues,
@@ -751,7 +781,28 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     return currentController?.extendedGamepad is GCDualSenseGamepad
   }
 
-  private func accessibilityTrusted(prompt: Bool) -> Bool {
+  @discardableResult
+  private func refreshAccessibilityTrust(prompt: Bool = false, emitOnChange: Bool = true) -> Bool {
+    let trusted = readAccessibilityTrusted(prompt: prompt)
+    guard trusted != accessibilityTrustedState else {
+      return trusted
+    }
+
+    accessibilityTrustedState = trusted
+    if trusted {
+      syncPreviousPressedWithCurrentInputs()
+    } else {
+      previousPressed.removeAll()
+      resetAdaptiveTriggers()
+    }
+    lastAction = trusted ? "Accessibility trusted" : "Accessibility revoked"
+    if emitOnChange {
+      emitSnapshot(force: true)
+    }
+    return trusted
+  }
+
+  private func readAccessibilityTrusted(prompt: Bool) -> Bool {
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt]
     return AXIsProcessTrustedWithOptions(options as CFDictionary)
   }

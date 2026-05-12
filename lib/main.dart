@@ -82,6 +82,16 @@ class _BridgeSenseHomeState extends State<BridgeSenseHome> {
     await _loadSnapshot();
   }
 
+  Future<void> _selectProfile(String profileId) async {
+    if (profileId == _snapshot.activeProfileId) {
+      return;
+    }
+    final snapshot = await _bridge.setActiveProfile(profileId);
+    if (mounted) {
+      setState(() => _snapshot = snapshot);
+    }
+  }
+
   Future<void> _updateMapping(BridgeMapping mapping) async {
     final mappings = _snapshot.mappings
         .map((item) => item.id == mapping.id ? mapping : item)
@@ -125,6 +135,11 @@ class _BridgeSenseHomeState extends State<BridgeSenseHome> {
                     TelemetryPanel(snapshot: _snapshot),
                   ];
                   final rightColumn = [
+                    ProfileSelector(
+                      snapshot: _snapshot,
+                      onProfileChanged: _selectProfile,
+                    ),
+                    const SizedBox(height: 14),
                     AxisBindingsPanel(
                       snapshot: _snapshot,
                       onMappingChanged: _updateMapping,
@@ -208,8 +223,8 @@ class HeaderBar extends StatelessWidget {
               ),
               Text(
                 snapshot.connected
-                    ? '${snapshot.controllerName} - ${snapshot.productCategory}'
-                    : 'No controller connected',
+                    ? '${snapshot.connectedControllerSummary} - editing ${snapshot.activeProfileName} profile'
+                    : 'Editing ${snapshot.activeProfileName} profile',
                 overflow: TextOverflow.ellipsis,
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
@@ -238,6 +253,78 @@ class HeaderBar extends StatelessWidget {
   }
 }
 
+class ProfileSelector extends StatelessWidget {
+  const ProfileSelector({
+    super.key,
+    required this.snapshot,
+    required this.onProfileChanged,
+  });
+
+  final ControllerSnapshot snapshot;
+  final ValueChanged<String> onProfileChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedProfileId =
+        controllerProfileOptions.any(
+          (profile) => profile.id == snapshot.activeProfileId,
+        )
+        ? snapshot.activeProfileId
+        : controllerProfileOptions.first.id;
+
+    return SectionCard(
+      title: 'Profiles',
+      icon: Icons.tune,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          if (constraints.maxWidth < 620) {
+            return DropdownButtonFormField<String>(
+              key: ValueKey('profile-picker-$selectedProfileId'),
+              initialValue: selectedProfileId,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Editing profile',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              items: [
+                for (final profile in controllerProfileOptions)
+                  DropdownMenuItem(
+                    value: profile.id,
+                    child: Text(profile.name),
+                  ),
+              ],
+              onChanged: (value) {
+                if (value != null) {
+                  onProfileChanged(value);
+                }
+              },
+            );
+          }
+
+          return SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<String>(
+              selected: {selectedProfileId},
+              showSelectedIcon: false,
+              segments: [
+                for (final profile in controllerProfileOptions)
+                  ButtonSegment<String>(
+                    value: profile.id,
+                    icon: Icon(profile.icon, size: 18),
+                    label: Text(profile.name),
+                  ),
+              ],
+              onSelectionChanged: (selection) =>
+                  onProfileChanged(selection.first),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
 class StatusPanel extends StatelessWidget {
   const StatusPanel({super.key, required this.snapshot});
 
@@ -256,9 +343,19 @@ class StatusPanel extends StatelessWidget {
             active: snapshot.connected,
           ),
           StatusLine(
-            label: 'DualSense',
-            value: snapshot.isDualSense ? 'Detected' : 'Generic profile',
-            active: snapshot.isDualSense,
+            label: 'Editing profile',
+            value: snapshot.activeProfileName,
+            active: snapshot.connected,
+          ),
+          StatusLine(
+            label: 'Controllers',
+            value: snapshot.connectedControllerSummary,
+            active: snapshot.connectedControllers.isNotEmpty,
+          ),
+          StatusLine(
+            label: 'Controller type',
+            value: controllerTypeLabel(snapshot.controllerType),
+            active: snapshot.connected,
           ),
           StatusLine(
             label: 'Output',
@@ -469,31 +566,25 @@ class AxisBindingsPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final left = snapshot.mappingFor('leftStick');
-    final right = snapshot.mappingFor('rightStick');
-    final touchpad = snapshot.mappingFor('touchpadMotion');
+    final motionRows = [
+      ('leftStick', 'L stick'),
+      ('rightStick', 'R stick'),
+      ('touchpadMotion', 'Touchpad'),
+    ].where((row) => snapshot.supportsControl(row.$1)).toList(growable: false);
+
     return SectionCard(
       title: 'Motion bindings',
       icon: Icons.control_camera,
       child: Column(
         children: [
-          StickBindingRow(
-            title: 'L stick',
-            mapping: left,
-            onChanged: onMappingChanged,
-          ),
-          const SizedBox(height: 10),
-          StickBindingRow(
-            title: 'R stick',
-            mapping: right,
-            onChanged: onMappingChanged,
-          ),
-          const SizedBox(height: 10),
-          StickBindingRow(
-            title: 'Touchpad',
-            mapping: touchpad,
-            onChanged: onMappingChanged,
-          ),
+          for (final row in motionRows) ...[
+            StickBindingRow(
+              title: row.$2,
+              mapping: snapshot.mappingFor(row.$1),
+              onChanged: onMappingChanged,
+            ),
+            if (row != motionRows.last) const SizedBox(height: 10),
+          ],
           const Divider(height: 28),
           SettingsSlider(
             label: 'Cursor speed',
@@ -629,13 +720,16 @@ class ButtonBindingsPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final buttonMappings = snapshot.mappings
-        .where((mapping) => !mapping.isMotionControl)
+        .where(
+          (mapping) =>
+              !mapping.isMotionControl && snapshot.supportsControl(mapping.id),
+        )
         .toList(growable: false);
     return SectionCard(
       title: 'Button bindings',
       icon: Icons.keyboard_command_key,
       trailing: IconButton(
-        tooltip: 'Reset bindings',
+        tooltip: 'Reset editing profile bindings',
         onPressed: onReset,
         icon: const Icon(Icons.restore),
       ),
@@ -1155,6 +1249,20 @@ class NativeBridge {
     await _invoke('setBridgeEnabled', enabled);
   }
 
+  Future<ControllerSnapshot> setActiveProfile(String profileId) async {
+    try {
+      final result = await _method.invokeMethod<dynamic>(
+        'setActiveProfile',
+        profileId,
+      );
+      return ControllerSnapshot.fromDynamic(result);
+    } on MissingPluginException {
+      return ControllerSnapshot.empty();
+    } on PlatformException {
+      return ControllerSnapshot.empty();
+    }
+  }
+
   Future<void> setMappings(List<BridgeMapping> mappings) async {
     await _invoke(
       'setMappings',
@@ -1197,6 +1305,11 @@ class ControllerSnapshot {
     required this.connected,
     required this.controllerName,
     required this.productCategory,
+    required this.controllerType,
+    required this.activeProfileId,
+    required this.activeProfileName,
+    required this.connectedControllers,
+    required this.supportedControlIds,
     required this.isDualSense,
     required this.hapticsAvailable,
     required this.adaptiveTriggersAvailable,
@@ -1213,6 +1326,11 @@ class ControllerSnapshot {
       connected: false,
       controllerName: 'No controller',
       productCategory: 'Unknown',
+      controllerType: 'none',
+      activeProfileId: 'dualSense',
+      activeProfileName: 'DualSense',
+      connectedControllers: const [],
+      supportedControlIds: defaultSupportedControlIds,
       isDualSense: false,
       hapticsAvailable: false,
       adaptiveTriggersAvailable: false,
@@ -1240,6 +1358,16 @@ class ControllerSnapshot {
       connected: asBool(map['connected']),
       controllerName: asString(map['controllerName'], 'No controller'),
       productCategory: asString(map['productCategory'], 'Unknown'),
+      controllerType: asString(map['controllerType'], 'none'),
+      activeProfileId: asString(map['activeProfileId'], 'dualSense'),
+      activeProfileName: asString(map['activeProfileName'], 'DualSense'),
+      connectedControllers: asList(map['connectedControllers'])
+          .map(ConnectedController.fromDynamic)
+          .whereType<ConnectedController>()
+          .toList(growable: false),
+      supportedControlIds: asList(
+        map['supportedControlIds'],
+      ).map((item) => item.toString()).toSet(),
       isDualSense: asBool(map['isDualSense']),
       hapticsAvailable: asBool(map['hapticsAvailable']),
       adaptiveTriggersAvailable: asBool(map['adaptiveTriggersAvailable']),
@@ -1257,6 +1385,11 @@ class ControllerSnapshot {
   final bool connected;
   final String controllerName;
   final String productCategory;
+  final String controllerType;
+  final String activeProfileId;
+  final String activeProfileName;
+  final List<ConnectedController> connectedControllers;
+  final Set<String> supportedControlIds;
   final bool isDualSense;
   final bool hapticsAvailable;
   final bool adaptiveTriggersAvailable;
@@ -1271,6 +1404,11 @@ class ControllerSnapshot {
     bool? connected,
     String? controllerName,
     String? productCategory,
+    String? controllerType,
+    String? activeProfileId,
+    String? activeProfileName,
+    List<ConnectedController>? connectedControllers,
+    Set<String>? supportedControlIds,
     bool? isDualSense,
     bool? hapticsAvailable,
     bool? adaptiveTriggersAvailable,
@@ -1285,6 +1423,11 @@ class ControllerSnapshot {
       connected: connected ?? this.connected,
       controllerName: controllerName ?? this.controllerName,
       productCategory: productCategory ?? this.productCategory,
+      controllerType: controllerType ?? this.controllerType,
+      activeProfileId: activeProfileId ?? this.activeProfileId,
+      activeProfileName: activeProfileName ?? this.activeProfileName,
+      connectedControllers: connectedControllers ?? this.connectedControllers,
+      supportedControlIds: supportedControlIds ?? this.supportedControlIds,
       isDualSense: isDualSense ?? this.isDualSense,
       hapticsAvailable: hapticsAvailable ?? this.hapticsAvailable,
       adaptiveTriggersAvailable:
@@ -1304,7 +1447,81 @@ class ControllerSnapshot {
       orElse: () => defaultMappings.firstWhere((mapping) => mapping.id == id),
     );
   }
+
+  bool supportsControl(String id) {
+    return supportedControlIds.isEmpty || supportedControlIds.contains(id);
+  }
+
+  String get connectedControllerSummary {
+    final count = connectedControllers.length;
+    if (count == 0) {
+      return 'None';
+    }
+    if (count == 1) {
+      return '1 connected';
+    }
+    return '$count connected';
+  }
 }
+
+class ConnectedController {
+  const ConnectedController({
+    required this.id,
+    required this.name,
+    required this.productCategory,
+    required this.controllerType,
+    required this.profileName,
+    required this.active,
+  });
+
+  static ConnectedController? fromDynamic(dynamic value) {
+    final map = asStringMap(value);
+    if (map.isEmpty) {
+      return null;
+    }
+    return ConnectedController(
+      id: asString(map['id']),
+      name: asString(map['name'], 'Controller'),
+      productCategory: asString(map['productCategory'], 'Unknown'),
+      controllerType: asString(map['controllerType'], 'generic'),
+      profileName: asString(map['profileName'], 'Generic'),
+      active: asBool(map['active']),
+    );
+  }
+
+  final String id;
+  final String name;
+  final String productCategory;
+  final String controllerType;
+  final String profileName;
+  final bool active;
+}
+
+class ControllerProfileOption {
+  const ControllerProfileOption({
+    required this.id,
+    required this.name,
+    required this.icon,
+  });
+
+  final String id;
+  final String name;
+  final IconData icon;
+}
+
+const controllerProfileOptions = [
+  ControllerProfileOption(
+    id: 'dualSense',
+    name: 'DualSense',
+    icon: Icons.sports_esports,
+  ),
+  ControllerProfileOption(
+    id: 'switchPro',
+    name: 'Switch Pro',
+    icon: Icons.gamepad,
+  ),
+  ControllerProfileOption(id: 'generic', name: 'Generic', icon: Icons.tune),
+];
 
 class BridgeSettings {
   const BridgeSettings({
@@ -1532,6 +1749,15 @@ const keyOptions = [
   KeyOption('F12', 111),
 ];
 
+String controllerTypeLabel(String type) {
+  return switch (type) {
+    'dualSense' => 'DualSense',
+    'switchPro' => 'Switch Pro',
+    'generic' => 'Generic',
+    _ => 'None',
+  };
+}
+
 KeyOption? keyOptionFor(int? keyCode) {
   if (keyCode == null) {
     return null;
@@ -1543,6 +1769,30 @@ KeyOption? keyOptionFor(int? keyCode) {
   }
   return null;
 }
+
+const defaultSupportedControlIds = {
+  'leftStick',
+  'rightStick',
+  'touchpadMotion',
+  'l2',
+  'r2',
+  'l1',
+  'r1',
+  'cross',
+  'circle',
+  'square',
+  'triangle',
+  'dpadUp',
+  'dpadDown',
+  'dpadLeft',
+  'dpadRight',
+  'leftStickButton',
+  'rightStickButton',
+  'menu',
+  'options',
+  'home',
+  'touchpad',
+};
 
 const defaultMappings = [
   BridgeMapping(

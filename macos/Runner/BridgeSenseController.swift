@@ -8,9 +8,11 @@ import IOKit.hid
 final class BridgeSenseController: NSObject, FlutterStreamHandler {
   static let shared = BridgeSenseController()
 
+  private let profilesKey = "BridgeSenseProfilesV1"
   private let mappingsKey = "BridgeSenseMappingsV2"
   private let settingsKey = "BridgeSenseSettingsV1"
   private let enabledKey = "BridgeSenseEnabledV1"
+  private let selectedProfileKey = "BridgeSenseSelectedProfileV1"
   private let buttonThreshold = 0.55
   private let accessibilityRefreshInterval = 1.0
 
@@ -19,18 +21,20 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   private var eventSink: FlutterEventSink?
   private var pollTimer: Timer?
   private var accessibilityTimer: Timer?
-  private var currentController: GCController?
-  private var previousPressed: [String: Bool] = [:]
+  private var activeController: GCController?
+  private var activeProfileType = BridgeControllerProfileType.dualSense
+  private var profileStore = BridgeProfileStore()
+  private var previousPressedByController: [String: [String: Bool]] = [:]
   private var inputValues: [String: Double] = [:]
   private var accessibilityTrustedState = false
   private var lastAction = ""
   private var lastEmit = Date.distantPast
-  private var hapticEngine: CHHapticEngine?
-  private var previousTouchpadPoint: CGPoint?
+  private var hapticEngines: [String: CHHapticEngine] = [:]
+  private var previousTouchpadPointByController: [String: CGPoint] = [:]
   private var rawTouchpadSample = TouchpadSample.inactive
   private let rawTouchpadReader = RawDualSenseTouchpadReader()
 
-  private var mappings: [BridgeMapping] = BridgeMapping.defaults
+  private var mappings: [BridgeMapping] = BridgeMapping.defaults(for: .generic)
   private var settings = BridgeSettings.defaults
   private var bridgeEnabled = true
 
@@ -95,6 +99,20 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       name: .GCControllerDidDisconnect,
       object: nil
     )
+    if #available(macOS 11.0, *) {
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(controllerDidChange(_:)),
+        name: .GCControllerDidBecomeCurrent,
+        object: nil
+      )
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(controllerDidChange(_:)),
+        name: .GCControllerDidStopBeingCurrent,
+        object: nil
+      )
+    }
 
     GCController.startWirelessControllerDiscovery(completionHandler: nil)
   }
@@ -104,28 +122,54 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   private func refreshController(reason: String) {
-    let candidates = GCController.controllers().filter { $0.extendedGamepad != nil }
-    let preferred = candidates.first { controller in
-      controller.vendorName?.localizedCaseInsensitiveContains("DualSense") == true
-        || controller.productCategory.localizedCaseInsensitiveContains("DualSense")
-    }
-
-    if let preferred {
-      currentController = preferred
-    } else if #available(macOS 11.0, *),
+    let candidates = connectedExtendedControllers()
+    let candidateIDs = candidates.map(controllerIdentity)
+    let currentID: String?
+    if #available(macOS 11.0, *),
       let current = GCController.current,
-      current.extendedGamepad != nil {
-      currentController = current
+      current.extendedGamepad != nil,
+      candidates.contains(where: { $0 === current }) {
+      currentID = controllerIdentity(current)
     } else {
-      currentController = candidates.first
+      currentID = nil
+    }
+    let selectedID = ActiveControllerSelector.select(
+      candidateIDs: candidateIDs,
+      currentID: currentID,
+      previousActiveID: activeController.map(controllerIdentity)
+    )
+    let selected = selectedID.flatMap { id in
+      candidates.first { controllerIdentity($0) == id }
     }
 
-    previousPressed.removeAll()
-    previousTouchpadPoint = nil
-    rawTouchpadSample = .inactive
-    inputValues = readInputs()
-    lastAction = currentController == nil ? "Waiting for controller" : reason
+    pruneControllerState(activeControllerIDs: Set(candidateIDs))
+    for controller in candidates where previousPressedByController[controllerIdentity(controller)] == nil {
+      syncPreviousPressed(for: controller)
+    }
+    if !candidates.contains(where: { profileType(for: $0) == .dualSense }) {
+      rawTouchpadSample = .inactive
+    }
+
+    activeController = selected
+    inputValues = selected.map { readInputs(for: $0) } ?? [:]
+    lastAction = candidates.isEmpty ? "Waiting for controller" : reason
     emitSnapshot(force: true)
+  }
+
+  private func connectedExtendedControllers() -> [GCController] {
+    GCController.controllers().filter { $0.extendedGamepad != nil }
+  }
+
+  private func pruneControllerState(activeControllerIDs: Set<String>) {
+    for id in Array(previousPressedByController.keys) where !activeControllerIDs.contains(id) {
+      previousPressedByController.removeValue(forKey: id)
+    }
+    for id in Array(previousTouchpadPointByController.keys) where !activeControllerIDs.contains(id) {
+      previousTouchpadPointByController.removeValue(forKey: id)
+    }
+    for id in Array(hapticEngines.keys) where !activeControllerIDs.contains(id) {
+      hapticEngines.removeValue(forKey: id)?.stop(completionHandler: nil)
+    }
   }
 
   private func startPolling() {
@@ -149,45 +193,86 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   private func poll() {
-    guard currentController?.extendedGamepad != nil else {
+    let controllers = connectedExtendedControllers()
+    guard !controllers.isEmpty else {
+      inputValues = [:]
       emitSnapshot()
       return
     }
 
-    inputValues = readInputs()
+    let controllerIDs = Set(controllers.map(controllerIdentity))
+    pruneControllerState(activeControllerIDs: controllerIDs)
+    inputValues = activeController.map { readInputs(for: $0) } ?? [:]
 
     if bridgeEnabled {
-      applyContinuousMappings()
-      applyButtonMappings()
+      for controller in controllers {
+        let controllerID = controllerIdentity(controller)
+        if previousPressedByController[controllerID] == nil {
+          syncPreviousPressed(for: controller)
+        }
+        let type = profileType(for: controller)
+        let profile = profileStore.profile(for: type)
+        let values = readInputs(for: controller)
+        applyContinuousMappings(
+          profile.mappings,
+          settings: profile.settings,
+          inputValues: values,
+          controller: controller,
+          controllerID: controllerID,
+          type: type
+        )
+        applyButtonMappings(
+          profile.mappings,
+          inputValues: values,
+          controller: controller,
+          controllerID: controllerID,
+          type: type
+        )
+      }
     }
 
     emitSnapshot()
   }
 
-  private func applyContinuousMappings() {
+  private func applyContinuousMappings(
+    _ mappings: [BridgeMapping],
+    settings: BridgeSettings,
+    inputValues: [String: Double],
+    controller: GCController,
+    controllerID: String,
+    type: BridgeControllerProfileType
+  ) {
     guard accessibilityTrustedState else {
       return
     }
 
     for mapping in mappings where isContinuousMapping(mapping.id) {
       if mapping.id == "touchpadMotion" {
-        applyTouchpadMapping(mapping)
+        guard type == .dualSense else {
+          continue
+        }
+        applyTouchpadMapping(
+          mapping,
+          inputValues: inputValues,
+          settings: settings,
+          controllerID: controllerID
+        )
         continue
       }
 
       let xKey = mapping.id == "leftStick" ? "leftStickX" : "rightStickX"
       let yKey = mapping.id == "leftStick" ? "leftStickY" : "rightStickY"
-      let x = filteredAxis(inputValues[xKey] ?? 0)
-      let y = filteredAxis(inputValues[yKey] ?? 0)
+      let x = filteredAxis(inputValues[xKey] ?? 0, settings: settings)
+      let y = filteredAxis(inputValues[yKey] ?? 0, settings: settings)
 
       switch mapping.action {
       case .cursor:
         if abs(x) > 0 || abs(y) > 0 {
-          moveCursor(x: x, y: y)
+          moveCursor(x: x, y: y, settings: settings)
         }
       case .scroll:
         if abs(x) > 0 || abs(y) > 0 {
-          scroll(x: x, y: y)
+          scroll(x: x, y: y, settings: settings)
         }
       default:
         break
@@ -195,33 +280,57 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     }
   }
 
-  private func applyButtonMappings() {
+  private func applyButtonMappings(
+    _ mappings: [BridgeMapping],
+    inputValues: [String: Double],
+    controller: GCController,
+    controllerID: String,
+    type: BridgeControllerProfileType
+  ) {
     let buttonValues = inputValues.filter { key, _ in
       !key.hasSuffix("X") && !key.hasSuffix("Y")
     }
+    var previousPressed = previousPressedByController[controllerID] ?? [:]
 
     for mapping in mappings where !isContinuousMapping(mapping.id) {
       let value = buttonValues[mapping.id] ?? 0
       let pressed = value >= buttonThreshold
       let wasPressed = previousPressed[mapping.id] ?? false
-      applyAdaptiveTriggerMapping(mapping, pressed: pressed, wasPressed: wasPressed)
+      applyAdaptiveTriggerMapping(
+        mapping,
+        pressed: pressed,
+        wasPressed: wasPressed,
+        controller: controller,
+        type: type
+      )
       if pressed && !wasPressed {
-        perform(mapping: mapping)
+        perform(mapping: mapping, controller: controller, controllerID: controllerID)
       }
       previousPressed[mapping.id] = pressed
     }
+    previousPressedByController[controllerID] = previousPressed
   }
 
   private func syncPreviousPressedWithCurrentInputs() {
-    guard currentController?.extendedGamepad != nil else {
-      previousPressed.removeAll()
+    let controllers = connectedExtendedControllers()
+    guard !controllers.isEmpty else {
+      previousPressedByController.removeAll()
       return
     }
-
-    inputValues = readInputs()
-    for mapping in mappings where !isContinuousMapping(mapping.id) {
-      previousPressed[mapping.id] = (inputValues[mapping.id] ?? 0) >= buttonThreshold
+    for controller in controllers {
+      syncPreviousPressed(for: controller)
     }
+  }
+
+  private func syncPreviousPressed(for controller: GCController) {
+    let type = profileType(for: controller)
+    let profile = profileStore.profile(for: type)
+    let values = readInputs(for: controller)
+    var previousPressed: [String: Bool] = [:]
+    for mapping in profile.mappings where !isContinuousMapping(mapping.id) {
+      previousPressed[mapping.id] = (values[mapping.id] ?? 0) >= buttonThreshold
+    }
+    previousPressedByController[controllerIdentity(controller)] = previousPressed
   }
 
   private func isContinuousMapping(_ id: String) -> Bool {
@@ -231,14 +340,19 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   private func applyAdaptiveTriggerMapping(
     _ mapping: BridgeMapping,
     pressed: Bool,
-    wasPressed: Bool
+    wasPressed: Bool,
+    controller: GCController,
+    type: BridgeControllerProfileType
   ) {
+    guard type == .dualSense else {
+      return
+    }
     guard let side = adaptiveTriggerSide(for: mapping.id) else {
       return
     }
     guard mapping.vibrate else {
       if pressed != wasPressed, !pressed {
-        resetAdaptiveTriggers(sides: side)
+        resetAdaptiveTriggers(sides: side, controller: controller)
       }
       return
     }
@@ -250,10 +364,11 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       configureAdaptiveTriggers(
         style: adaptiveTriggerStyle(for: mapping),
         sides: side,
-        resetAfterDelay: false
+        resetAfterDelay: false,
+        controller: controller
       )
     } else {
-      resetAdaptiveTriggers(sides: side)
+      resetAdaptiveTriggers(sides: side, controller: controller)
     }
   }
 
@@ -275,7 +390,12 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     return mapping.id == "r2" ? "gunshot" : "engine"
   }
 
-  private func applyTouchpadMapping(_ mapping: BridgeMapping) {
+  private func applyTouchpadMapping(
+    _ mapping: BridgeMapping,
+    inputValues: [String: Double],
+    settings: BridgeSettings,
+    controllerID: String
+  ) {
     applyTouchpadSample(
       TouchpadSample(
         point: CGPoint(
@@ -285,19 +405,27 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
         button: inputValues["touchpad"] ?? 0,
         active: (inputValues["touchpadActive"] ?? 0) >= 0.5
       ),
-      mapping: mapping
+      mapping: mapping,
+      settings: settings,
+      controllerID: controllerID
     )
   }
 
-  private func applyTouchpadSample(_ sample: TouchpadSample, mapping: BridgeMapping) {
+  private func applyTouchpadSample(
+    _ sample: TouchpadSample,
+    mapping: BridgeMapping,
+    settings: BridgeSettings,
+    controllerID: String
+  ) {
     guard sample.active else {
-      previousTouchpadPoint = nil
+      previousTouchpadPointByController[controllerID] = nil
       return
     }
 
     let point = sample.point
-    defer { previousTouchpadPoint = point }
+    defer { previousTouchpadPointByController[controllerID] = point }
 
+    let previousTouchpadPoint = previousTouchpadPointByController[controllerID]
     guard let previousTouchpadPoint else {
       return
     }
@@ -327,24 +455,48 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   private func handleRawTouchpadSample(_ sample: TouchpadSample) {
-    rawTouchpadSample = sample
-    inputValues["touchpad"] = sample.button
-    inputValues["touchpadX"] = sample.active ? Double(sample.point.x) : 0
-    inputValues["touchpadY"] = sample.active ? Double(sample.point.y) : 0
-    inputValues["touchpadActive"] = sample.active ? 1 : 0
+    guard let controller = dualSenseControllerForRawTouchpadSample() else {
+      return
+    }
 
+    let controllerID = controllerIdentity(controller)
+    rawTouchpadSample = sample
+    if activeController === controller {
+      inputValues["touchpad"] = sample.button
+      inputValues["touchpadX"] = sample.active ? Double(sample.point.x) : 0
+      inputValues["touchpadY"] = sample.active ? Double(sample.point.y) : 0
+      inputValues["touchpadActive"] = sample.active ? 1 : 0
+    }
+
+    let profile = profileStore.profile(for: .dualSense)
     guard bridgeEnabled,
       accessibilityTrustedState,
-      let mapping = mappings.first(where: { $0.id == "touchpadMotion" }) else {
+      let mapping = profile.mappings.first(where: { $0.id == "touchpadMotion" }) else {
       emitSnapshot()
       return
     }
 
-    applyTouchpadSample(sample, mapping: mapping)
+    applyTouchpadSample(
+      sample,
+      mapping: mapping,
+      settings: profile.settings,
+      controllerID: controllerID
+    )
     emitSnapshot()
   }
 
-  private func perform(mapping: BridgeMapping) {
+  private func dualSenseControllerForRawTouchpadSample() -> GCController? {
+    let dualSenseControllers = connectedExtendedControllers().filter {
+      profileType(for: $0) == .dualSense
+    }
+    if let activeController,
+      dualSenseControllers.contains(where: { $0 === activeController }) {
+      return activeController
+    }
+    return dualSenseControllers.first
+  }
+
+  private func perform(mapping: BridgeMapping, controller: GCController, controllerID: String) {
     var actionDescription: String?
 
     switch mapping.action {
@@ -372,7 +524,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
 
     if mapping.vibrate || mapping.action == .haptic {
       do {
-        try playHaptic(style: mapping.hapticStyle)
+        try playHaptic(style: mapping.hapticStyle, controller: controller, controllerID: controllerID)
         let hapticDescription = "vibration \(mapping.hapticStyle)"
         if let existingDescription = actionDescription {
           actionDescription = "\(existingDescription); \(hapticDescription)"
@@ -390,11 +542,11 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     emitSnapshot(force: true)
   }
 
-  private func filteredAxis(_ value: Double) -> Double {
+  private func filteredAxis(_ value: Double, settings: BridgeSettings) -> Double {
     abs(value) < settings.deadZone ? 0 : value
   }
 
-  private func moveCursor(x: Double, y: Double) {
+  private func moveCursor(x: Double, y: Double, settings: BridgeSettings) {
     let dx = CGFloat(x * settings.pointerSpeed)
     let dy = CGFloat(-y * settings.pointerSpeed)
     moveCursorBy(dx: dx, dy: dy)
@@ -415,7 +567,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     )?.post(tap: .cghidEventTap)
   }
 
-  private func scroll(x: Double, y: Double) {
+  private func scroll(x: Double, y: Double, settings: BridgeSettings) {
     let horizontal = Int32((x * settings.scrollSpeed).rounded())
     let vertical = Int32((y * settings.scrollSpeed).rounded())
     scrollDelta(horizontal: horizontal, vertical: vertical)
@@ -493,8 +645,8 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     return flags
   }
 
-  private func readInputs() -> [String: Double] {
-    guard let gamepad = currentController?.extendedGamepad else {
+  private func readInputs(for controller: GCController) -> [String: Double] {
+    guard let gamepad = controller.extendedGamepad else {
       return [:]
     }
 
@@ -532,7 +684,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       values["home"] = Double(gamepad.buttonHome?.value ?? 0)
     }
 
-    let touchpadSample = readTouchpadSample(gamepad: gamepad)
+    let touchpadSample = readTouchpadSample(gamepad: gamepad, controller: controller)
     values["touchpad"] = touchpadSample.button
     values["touchpadX"] = touchpadSample.active ? Double(touchpadSample.point.x) : 0
     values["touchpadY"] = touchpadSample.active ? Double(touchpadSample.point.y) : 0
@@ -541,13 +693,19 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     return values
   }
 
-  private func readTouchpadSample(gamepad: GCExtendedGamepad) -> TouchpadSample {
-    if rawTouchpadSample.active {
+  private func readTouchpadSample(
+    gamepad: GCExtendedGamepad,
+    controller: GCController
+  ) -> TouchpadSample {
+    let type = profileType(for: controller)
+    if type == .dualSense,
+      rawTouchpadSample.active,
+      dualSenseControllerForRawTouchpadSample() === controller {
       return rawTouchpadSample
     }
 
     if #available(macOS 11.0, *),
-      let touchpad = currentControllerTouchpad() {
+      let touchpad = controllerTouchpad(for: controller) {
       let active = touchpad.touchState == .down || touchpad.touchState == .moving
       if active {
         return TouchpadSample(
@@ -581,11 +739,8 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   @available(macOS 11.0, *)
-  private func currentControllerTouchpad() -> GCControllerTouchpad? {
-    guard let currentController else {
-      return nil
-    }
-    let touchpads = currentController.physicalInputProfile.touchpads
+  private func controllerTouchpad(for controller: GCController) -> GCControllerTouchpad? {
+    let touchpads = controller.physicalInputProfile.touchpads
     return touchpads.values.first { touchpad in
       touchpad.touchState == .down || touchpad.touchState == .moving
     } ?? touchpads[GCInputDualShockTouchpadOne] ?? touchpads.values.first
@@ -625,7 +780,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       bridgeEnabled = (call.arguments as? Bool) ?? true
       if !bridgeEnabled {
         resetAdaptiveTriggers()
-        previousPressed.removeAll()
+        previousPressedByController.removeAll()
       }
       UserDefaults.standard.set(bridgeEnabled, forKey: enabledKey)
       emitSnapshot(force: true)
@@ -635,20 +790,40 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
         result(FlutterError(code: "bad_args", message: "Expected mappings", details: nil))
         return
       }
-      mappings = normalizeMappings(rawMappings.compactMap(BridgeMapping.init(dictionary:)))
+      mappings = normalizeMappings(
+        rawMappings.compactMap(BridgeMapping.init(dictionary:)),
+        for: activeProfileType
+      )
       resetDisabledAdaptiveTriggers()
-      saveMappings()
+      saveActiveProfile()
       emitSnapshot(force: true)
       result(nil)
+    case "setActiveProfile":
+      let profileId: String?
+      if let id = call.arguments as? String {
+        profileId = id
+      } else {
+        profileId = (call.arguments as? [String: Any])?["profileId"] as? String
+      }
+      guard let profileId,
+        let type = BridgeControllerProfileType(rawValue: profileId) else {
+        result(FlutterError(code: "bad_args", message: "Expected profile id", details: nil))
+        return
+      }
+      activateProfile(for: type)
+      UserDefaults.standard.set(type.rawValue, forKey: selectedProfileKey)
+      emitSnapshot(force: true)
+      result(snapshot())
     case "setSettings":
       settings = BridgeSettings(dictionary: call.arguments as? [String: Any]) ?? .defaults
-      saveSettings()
+      saveActiveProfile()
       emitSnapshot(force: true)
       result(nil)
     case "resetMappings":
-      mappings = BridgeMapping.defaults
+      mappings = BridgeMapping.defaults(for: activeProfileType)
       resetAdaptiveTriggers()
-      saveMappings()
+      previousPressedByController.removeAll()
+      saveActiveProfile()
       emitSnapshot(force: true)
       result(snapshot())
     case "requestAccessibility":
@@ -681,56 +856,113 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     if defaults.object(forKey: enabledKey) != nil {
       bridgeEnabled = defaults.bool(forKey: enabledKey)
     }
-
-    if let raw = defaults.array(forKey: mappingsKey) {
-      let loaded = raw.compactMap { item -> BridgeMapping? in
-        guard let dictionary = item as? [String: Any] else {
-          return nil
-        }
-        return BridgeMapping(dictionary: dictionary)
-      }
-      if !loaded.isEmpty {
-        mappings = normalizeMappings(loaded)
-      }
+    if let savedProfileId = defaults.string(forKey: selectedProfileKey),
+      let savedProfileType = BridgeControllerProfileType(rawValue: savedProfileId) {
+      activeProfileType = savedProfileType
     }
 
-    if let dictionary = defaults.dictionary(forKey: settingsKey),
-      let loaded = BridgeSettings(dictionary: dictionary) {
-      settings = loaded
-    }
+    profileStore = BridgeProfileStore(
+      savedProfiles: defaults.array(forKey: profilesKey),
+      legacyMappings: defaults.array(forKey: mappingsKey),
+      legacySettings: defaults.dictionary(forKey: settingsKey)
+    )
+    activateProfile(for: activeProfileType)
   }
 
-  private func saveMappings() {
+  private func saveProfiles() {
     UserDefaults.standard.set(
-      mappings.map { $0.dictionary(includeNil: false) },
-      forKey: mappingsKey
+      profileStore.dictionary,
+      forKey: profilesKey
     )
   }
 
-  private func saveSettings() {
-    UserDefaults.standard.set(settings.dictionary, forKey: settingsKey)
+  private func saveActiveProfile() {
+    profileStore.update(
+      BridgeProfile(
+        type: activeProfileType,
+        mappings: mappings,
+        settings: settings
+      )
+    )
+    saveProfiles()
   }
 
-  private func normalizeMappings(_ loaded: [BridgeMapping]) -> [BridgeMapping] {
-    BridgeMapping.defaults.map { fallback in
+  private func activateProfile(for type: BridgeControllerProfileType) {
+    activeProfileType = type
+    let profile = profileStore.profile(for: type)
+    mappings = profile.mappings
+    settings = profile.settings
+  }
+
+  private func normalizeMappings(
+    _ loaded: [BridgeMapping],
+    for type: BridgeControllerProfileType
+  ) -> [BridgeMapping] {
+    BridgeMapping.defaults(for: type).map { fallback in
       guard let existing = loaded.first(where: { $0.id == fallback.id }) else {
         return fallback
       }
       if existing.id == "touchpad" && existing.action == .none && existing.label.isEmpty {
         return fallback
       }
-      return existing
+      return existing.withControlLabel(fallback.controlLabel)
     }
   }
 
+  private func connectedControllerDictionaries() -> [[String: Any]] {
+    let controllers = GCController.controllers().filter { $0.extendedGamepad != nil }
+    let activeID = activeController.map(controllerIdentity)
+
+    return controllers.map { controller in
+      let id = controllerIdentity(controller)
+      let type = profileType(for: controller)
+      return [
+        "id": id,
+        "name": controller.vendorName ?? type.displayName,
+        "productCategory": controller.productCategory,
+        "controllerType": type.rawValue,
+        "profileName": type.displayName,
+        "active": id == activeID,
+      ]
+    }
+  }
+
+  private func controllerIdentity(_ controller: GCController) -> String {
+    String(describing: ObjectIdentifier(controller))
+  }
+
+  private func profileType(for controller: GCController?) -> BridgeControllerProfileType {
+    guard let controller else {
+      return .generic
+    }
+    return BridgeControllerProfileType.resolve(
+      vendorName: controller.vendorName,
+      productCategory: controller.productCategory,
+      isDualSenseGamepad: isDualSenseGamepad(controller)
+    )
+  }
+
+  private func isDualSenseGamepad(_ controller: GCController) -> Bool {
+    if #available(macOS 11.3, *) {
+      return controller.extendedGamepad is GCDualSenseGamepad
+    }
+    return false
+  }
+
   private func snapshot() -> [String: Any] {
-    let controller = currentController
+    let controller = activeController
     let vendorName = controller?.vendorName ?? "No controller"
     let category = controller?.productCategory ?? "Unknown"
+    let controllerType = controller.map { profileType(for: $0) } ?? .generic
     return [
       "connected": controller != nil,
       "controllerName": vendorName,
       "productCategory": category,
+      "controllerType": controller == nil ? "none" : controllerType.rawValue,
+      "activeProfileId": activeProfileType.rawValue,
+      "activeProfileName": activeProfileType.displayName,
+      "connectedControllers": connectedControllerDictionaries(),
+      "supportedControlIds": activeProfileType.supportedControlIDs,
       "isDualSense": isDualSense,
       "hapticsAvailable": hapticsAvailable,
       "adaptiveTriggersAvailable": adaptiveTriggersAvailable,
@@ -756,29 +988,31 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   private var isDualSense: Bool {
-    if #available(macOS 11.3, *) {
-      if currentController?.extendedGamepad is GCDualSenseGamepad {
-        return true
-      }
-    }
-    return rawTouchpadReader.hasDualSenseDevice
+    activeProfileType == .dualSense
   }
 
   private var hapticsAvailable: Bool {
     guard #available(macOS 11.0, *) else {
       return false
     }
-    return currentController?.haptics != nil
+    return connectedExtendedControllers().contains { controller in
+      profileType(for: controller) == activeProfileType && controller.haptics != nil
+    }
   }
 
   private var adaptiveTriggersAvailable: Bool {
+    guard activeProfileType == .dualSense else {
+      return false
+    }
     if rawTouchpadReader.hasDualSenseDevice {
       return true
     }
     guard #available(macOS 11.3, *) else {
       return false
     }
-    return currentController?.extendedGamepad is GCDualSenseGamepad
+    return connectedExtendedControllers().contains { controller in
+      controller.extendedGamepad is GCDualSenseGamepad
+    }
   }
 
   @discardableResult
@@ -792,7 +1026,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     if trusted {
       syncPreviousPressedWithCurrentInputs()
     } else {
-      previousPressed.removeAll()
+      previousPressedByController.removeAll()
       resetAdaptiveTriggers()
     }
     lastAction = trusted ? "Accessibility trusted" : "Accessibility revoked"
@@ -811,12 +1045,30 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     guard #available(macOS 11.0, *) else {
       throw BridgeSenseError.hapticsUnavailable
     }
-    guard let haptics = currentController?.haptics,
-      let engine = hapticEngine ?? haptics.createEngine(withLocality: .default) else {
+    guard let activeController else {
+      throw BridgeSenseError.hapticsUnavailable
+    }
+    try playHaptic(
+      style: style,
+      controller: activeController,
+      controllerID: controllerIdentity(activeController)
+    )
+  }
+
+  private func playHaptic(
+    style: String,
+    controller: GCController,
+    controllerID: String
+  ) throws {
+    guard #available(macOS 11.0, *) else {
+      throw BridgeSenseError.hapticsUnavailable
+    }
+    guard let haptics = controller.haptics,
+      let engine = hapticEngines[controllerID] ?? haptics.createEngine(withLocality: .default) else {
       throw BridgeSenseError.hapticsUnavailable
     }
 
-    hapticEngine = engine
+    hapticEngines[controllerID] = engine
     try engine.start()
     try playPattern(style: style, engine: engine)
   }
@@ -880,15 +1132,18 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
   }
 
   private func stopHaptics() {
-    hapticEngine?.stop(completionHandler: nil)
-    hapticEngine = nil
+    for engine in hapticEngines.values {
+      engine.stop(completionHandler: nil)
+    }
+    hapticEngines.removeAll()
     resetAdaptiveTriggers()
   }
 
   private func configureAdaptiveTriggers(
     style: String,
     sides requestedSides: DualSenseTriggerSides? = nil,
-    resetAfterDelay: Bool = true
+    resetAfterDelay: Bool = true,
+    controller: GCController? = nil
   ) {
     let effect = DualSenseAdaptiveTriggerEffect.effect(
       forHapticStyle: style,
@@ -896,8 +1151,9 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     )
     rawTouchpadReader.setAdaptiveTriggers(effect)
 
+    let targetController = controller ?? activeController
     if #available(macOS 11.3, *),
-      let dualSense = currentController?.extendedGamepad as? GCDualSenseGamepad {
+      let dualSense = targetController?.extendedGamepad as? GCDualSenseGamepad {
       configureGameControllerAdaptiveTriggers(
         dualSense,
         style: style,
@@ -909,7 +1165,7 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
       return
     }
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-      self?.resetAdaptiveTriggers(sides: effect.sides)
+      self?.resetAdaptiveTriggers(sides: effect.sides, controller: targetController)
     }
   }
 
@@ -958,17 +1214,26 @@ final class BridgeSenseController: NSObject, FlutterStreamHandler {
     }
   }
 
-  private func resetAdaptiveTriggers(sides: DualSenseTriggerSides = .both) {
+  private func resetAdaptiveTriggers(
+    sides: DualSenseTriggerSides = .both,
+    controller: GCController? = nil
+  ) {
     rawTouchpadReader.setAdaptiveTriggers(.off(sides: sides))
+    let controllers = controller.map { [$0] } ?? connectedExtendedControllers()
     guard #available(macOS 11.3, *),
-      let dualSense = currentController?.extendedGamepad as? GCDualSenseGamepad else {
+      !controllers.isEmpty else {
       return
     }
-    if sides.contains(.left) {
-      dualSense.leftTrigger.setModeOff()
-    }
-    if sides.contains(.right) {
-      dualSense.rightTrigger.setModeOff()
+    for controller in controllers {
+      guard let dualSense = controller.extendedGamepad as? GCDualSenseGamepad else {
+        continue
+      }
+      if sides.contains(.left) {
+        dualSense.leftTrigger.setModeOff()
+      }
+      if sides.contains(.right) {
+        dualSense.rightTrigger.setModeOff()
+      }
     }
   }
 
@@ -1742,7 +2007,7 @@ private struct DualSenseAdaptiveTriggerEffect {
   }
 }
 
-private enum BridgeSenseError: LocalizedError {
+enum BridgeSenseError: LocalizedError {
   case hapticsUnavailable
 
   var errorDescription: String? {
@@ -1753,7 +2018,7 @@ private enum BridgeSenseError: LocalizedError {
   }
 }
 
-private enum BridgeAction: String {
+enum BridgeAction: String {
   case none
   case cursor
   case scroll
@@ -1762,7 +2027,7 @@ private enum BridgeAction: String {
   case haptic
 }
 
-private enum MouseButton: String {
+enum MouseButton: String {
   case left
   case right
 
@@ -1803,7 +2068,277 @@ private enum MouseButton: String {
   }
 }
 
-private struct BridgeSettings {
+enum BridgeControllerProfileType: String, CaseIterable {
+  case dualSense
+  case switchPro
+  case generic
+
+  var displayName: String {
+    switch self {
+    case .dualSense:
+      return "DualSense"
+    case .switchPro:
+      return "Switch Pro"
+    case .generic:
+      return "Generic"
+    }
+  }
+
+  var supportedControlIDs: [String] {
+    switch self {
+    case .dualSense:
+      return [
+        "leftStick",
+        "rightStick",
+        "touchpadMotion",
+        "l2",
+        "r2",
+        "l1",
+        "r1",
+        "cross",
+        "circle",
+        "square",
+        "triangle",
+        "dpadUp",
+        "dpadDown",
+        "dpadLeft",
+        "dpadRight",
+        "leftStickButton",
+        "rightStickButton",
+        "menu",
+        "options",
+        "home",
+        "touchpad",
+      ]
+    case .switchPro, .generic:
+      return [
+        "leftStick",
+        "rightStick",
+        "l2",
+        "r2",
+        "l1",
+        "r1",
+        "cross",
+        "circle",
+        "square",
+        "triangle",
+        "dpadUp",
+        "dpadDown",
+        "dpadLeft",
+        "dpadRight",
+        "leftStickButton",
+        "rightStickButton",
+        "menu",
+        "options",
+        "home",
+      ]
+    }
+  }
+
+  var controlLabels: [String: String] {
+    switch self {
+    case .dualSense:
+      return [:]
+    case .switchPro:
+      return [
+        "l2": "ZL",
+        "r2": "ZR",
+        "l1": "L",
+        "r1": "R",
+        "cross": "B",
+        "circle": "A",
+        "square": "Y",
+        "triangle": "X",
+        "menu": "Plus",
+        "options": "Minus",
+        "home": "Home",
+      ]
+    case .generic:
+      return [
+        "cross": "Button A",
+        "circle": "Button B",
+        "square": "Button X",
+        "triangle": "Button Y",
+        "home": "Home",
+      ]
+    }
+  }
+
+  static func resolve(
+    vendorName: String?,
+    productCategory: String?,
+    isDualSenseGamepad: Bool = false
+  ) -> BridgeControllerProfileType {
+    if isDualSenseGamepad {
+      return .dualSense
+    }
+
+    let normalized = [vendorName, productCategory]
+      .compactMap { $0 }
+      .joined(separator: " ")
+      .lowercased()
+      .filter { $0.isLetter || $0.isNumber }
+
+    if normalized.contains("dualsense") {
+      return .dualSense
+    }
+    if normalized.contains("nintendo")
+      || normalized.contains("switch")
+      || normalized.contains("procontroller") {
+      return .switchPro
+    }
+    return .generic
+  }
+}
+
+struct ActiveControllerSelector {
+  static func outputControllerIDs(candidateIDs: [String]) -> [String] {
+    candidateIDs
+  }
+
+  static func select(
+    candidateIDs: [String],
+    currentID: String?,
+    previousActiveID: String?
+  ) -> String? {
+    if let currentID, candidateIDs.contains(currentID) {
+      return currentID
+    }
+    if let previousActiveID, candidateIDs.contains(previousActiveID) {
+      return previousActiveID
+    }
+    return candidateIDs.first
+  }
+}
+
+struct BridgeProfile: Equatable {
+  let id: String
+  let name: String
+  var mappings: [BridgeMapping]
+  var settings: BridgeSettings
+
+  init(
+    type: BridgeControllerProfileType,
+    mappings: [BridgeMapping]? = nil,
+    settings: BridgeSettings = .defaults
+  ) {
+    id = type.rawValue
+    name = type.displayName
+    self.mappings = BridgeProfile.normalizedMappings(
+      mappings ?? BridgeMapping.defaults(for: type),
+      for: type
+    )
+    self.settings = settings
+  }
+
+  init?(dictionary: [String: Any]) {
+    guard let id = dictionary["id"] as? String,
+      let type = BridgeControllerProfileType(rawValue: id) else {
+      return nil
+    }
+
+    let loadedMappings = (dictionary["mappings"] as? [[String: Any]])?
+      .compactMap(BridgeMapping.init(dictionary:))
+    let loadedSettings = BridgeSettings(dictionary: dictionary["settings"] as? [String: Any])
+      ?? .defaults
+
+    self.init(
+      type: type,
+      mappings: loadedMappings,
+      settings: loadedSettings
+    )
+  }
+
+  var dictionary: [String: Any] {
+    [
+      "id": id,
+      "name": name,
+      "mappings": mappings.map { $0.dictionary(includeNil: false) },
+      "settings": settings.dictionary,
+    ]
+  }
+
+  private static func normalizedMappings(
+    _ mappings: [BridgeMapping],
+    for type: BridgeControllerProfileType
+  ) -> [BridgeMapping] {
+    BridgeMapping.defaults(for: type).map { fallback in
+      guard let existing = mappings.first(where: { $0.id == fallback.id }) else {
+        return fallback
+      }
+      return existing.withControlLabel(fallback.controlLabel)
+    }
+  }
+}
+
+struct BridgeProfileStore {
+  private(set) var profiles: [String: BridgeProfile]
+
+  init(
+    savedProfiles: [Any]? = nil,
+    legacyMappings: [Any]? = nil,
+    legacySettings: [String: Any]? = nil
+  ) {
+    var loadedProfiles = [String: BridgeProfile]()
+    for item in savedProfiles ?? [] {
+      guard let dictionary = item as? [String: Any],
+        let profile = BridgeProfile(dictionary: dictionary) else {
+        continue
+      }
+      loadedProfiles[profile.id] = profile
+    }
+
+    if loadedProfiles.isEmpty {
+      loadedProfiles = Self.defaultProfiles()
+      let migratedMappings = legacyMappings?
+        .compactMap { $0 as? [String: Any] }
+        .compactMap(BridgeMapping.init(dictionary:))
+      let migratedSettings = BridgeSettings(dictionary: legacySettings) ?? .defaults
+      if migratedMappings?.isEmpty == false || legacySettings != nil {
+        loadedProfiles[BridgeControllerProfileType.dualSense.rawValue] = BridgeProfile(
+          type: .dualSense,
+          mappings: migratedMappings,
+          settings: migratedSettings
+        )
+      }
+    } else {
+      for type in BridgeControllerProfileType.allCases where loadedProfiles[type.rawValue] == nil {
+        loadedProfiles[type.rawValue] = BridgeProfile(type: type)
+      }
+    }
+
+    profiles = loadedProfiles
+  }
+
+  mutating func profile(for type: BridgeControllerProfileType) -> BridgeProfile {
+    if let profile = profiles[type.rawValue] {
+      return profile
+    }
+    let profile = BridgeProfile(type: type)
+    profiles[type.rawValue] = profile
+    return profile
+  }
+
+  mutating func update(_ profile: BridgeProfile) {
+    profiles[profile.id] = profile
+  }
+
+  var dictionary: [[String: Any]] {
+    BridgeControllerProfileType.allCases.map { type in
+      (profiles[type.rawValue] ?? BridgeProfile(type: type)).dictionary
+    }
+  }
+
+  private static func defaultProfiles() -> [String: BridgeProfile] {
+    Dictionary(
+      uniqueKeysWithValues: BridgeControllerProfileType.allCases.map { type in
+        (type.rawValue, BridgeProfile(type: type))
+      }
+    )
+  }
+}
+
+struct BridgeSettings: Equatable {
   static let defaults = BridgeSettings(pointerSpeed: 22, scrollSpeed: 14, deadZone: 0.12)
 
   let pointerSpeed: Double
@@ -1846,30 +2381,37 @@ private struct BridgeSettings {
   }
 }
 
-private struct BridgeMapping {
-  static let defaults: [BridgeMapping] = [
-    BridgeMapping(id: "leftStick", controlLabel: "L stick", action: .cursor, label: "Cursor"),
-    BridgeMapping(id: "rightStick", controlLabel: "R stick", action: .scroll, label: "Scroll"),
-    BridgeMapping(id: "touchpadMotion", controlLabel: "Touchpad move", action: .cursor, label: "Mouse move"),
-    BridgeMapping(id: "l2", controlLabel: "L2"),
-    BridgeMapping(id: "r2", controlLabel: "R2"),
-    BridgeMapping(id: "l1", controlLabel: "L1"),
-    BridgeMapping(id: "r1", controlLabel: "R1"),
-    BridgeMapping(id: "cross", controlLabel: "Cross / A"),
-    BridgeMapping(id: "circle", controlLabel: "Circle / B"),
-    BridgeMapping(id: "square", controlLabel: "Square / X"),
-    BridgeMapping(id: "triangle", controlLabel: "Triangle / Y"),
-    BridgeMapping(id: "dpadUp", controlLabel: "D-pad up"),
-    BridgeMapping(id: "dpadDown", controlLabel: "D-pad down"),
-    BridgeMapping(id: "dpadLeft", controlLabel: "D-pad left"),
-    BridgeMapping(id: "dpadRight", controlLabel: "D-pad right"),
-    BridgeMapping(id: "leftStickButton", controlLabel: "L3"),
-    BridgeMapping(id: "rightStickButton", controlLabel: "R3"),
-    BridgeMapping(id: "menu", controlLabel: "Menu"),
-    BridgeMapping(id: "options", controlLabel: "Options"),
-    BridgeMapping(id: "home", controlLabel: "PS / Home"),
-    BridgeMapping(id: "touchpad", controlLabel: "Touchpad click"),
-  ]
+struct BridgeMapping: Equatable {
+  static func defaults(for type: BridgeControllerProfileType = .dualSense) -> [BridgeMapping] {
+    baseDefaults(for: type).filter { type.supportedControlIDs.contains($0.id) }
+  }
+
+  private static func baseDefaults(for type: BridgeControllerProfileType) -> [BridgeMapping] {
+    let labels = type.controlLabels
+    return [
+      BridgeMapping(id: "leftStick", controlLabel: labels["leftStick"] ?? "L stick", action: .cursor, label: "Cursor"),
+      BridgeMapping(id: "rightStick", controlLabel: labels["rightStick"] ?? "R stick", action: .scroll, label: "Scroll"),
+      BridgeMapping(id: "touchpadMotion", controlLabel: labels["touchpadMotion"] ?? "Touchpad move", action: .cursor, label: "Mouse move"),
+      BridgeMapping(id: "l2", controlLabel: labels["l2"] ?? "L2"),
+      BridgeMapping(id: "r2", controlLabel: labels["r2"] ?? "R2"),
+      BridgeMapping(id: "l1", controlLabel: labels["l1"] ?? "L1"),
+      BridgeMapping(id: "r1", controlLabel: labels["r1"] ?? "R1"),
+      BridgeMapping(id: "cross", controlLabel: labels["cross"] ?? "Cross / A"),
+      BridgeMapping(id: "circle", controlLabel: labels["circle"] ?? "Circle / B"),
+      BridgeMapping(id: "square", controlLabel: labels["square"] ?? "Square / X"),
+      BridgeMapping(id: "triangle", controlLabel: labels["triangle"] ?? "Triangle / Y"),
+      BridgeMapping(id: "dpadUp", controlLabel: labels["dpadUp"] ?? "D-pad up"),
+      BridgeMapping(id: "dpadDown", controlLabel: labels["dpadDown"] ?? "D-pad down"),
+      BridgeMapping(id: "dpadLeft", controlLabel: labels["dpadLeft"] ?? "D-pad left"),
+      BridgeMapping(id: "dpadRight", controlLabel: labels["dpadRight"] ?? "D-pad right"),
+      BridgeMapping(id: "leftStickButton", controlLabel: labels["leftStickButton"] ?? "L3"),
+      BridgeMapping(id: "rightStickButton", controlLabel: labels["rightStickButton"] ?? "R3"),
+      BridgeMapping(id: "menu", controlLabel: labels["menu"] ?? "Menu"),
+      BridgeMapping(id: "options", controlLabel: labels["options"] ?? "Options"),
+      BridgeMapping(id: "home", controlLabel: labels["home"] ?? "PS / Home"),
+      BridgeMapping(id: "touchpad", controlLabel: labels["touchpad"] ?? "Touchpad click"),
+    ]
+  }
 
   let id: String
   let controlLabel: String
@@ -1908,7 +2450,7 @@ private struct BridgeMapping {
 
   init?(dictionary: [String: Any]) {
     guard let id = dictionary["id"] as? String,
-      let fallback = BridgeMapping.defaults.first(where: { $0.id == id }) else {
+      let fallback = BridgeMapping.defaultMapping(id: id) else {
       return nil
     }
 
@@ -1959,5 +2501,24 @@ private struct BridgeMapping {
       dictionary["keyCode"] = NSNull()
     }
     return dictionary
+  }
+
+  func withControlLabel(_ controlLabel: String) -> BridgeMapping {
+    BridgeMapping(
+      id: id,
+      controlLabel: controlLabel,
+      action: action,
+      label: label,
+      keyCode: keyCode,
+      keyLabel: keyLabel,
+      mouseButton: mouseButton,
+      modifiers: modifiers,
+      vibrate: vibrate,
+      hapticStyle: hapticStyle
+    )
+  }
+
+  private static func defaultMapping(id: String) -> BridgeMapping? {
+    baseDefaults(for: .dualSense).first { $0.id == id }
   }
 }

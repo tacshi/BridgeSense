@@ -5,7 +5,7 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
-  func testControllerTypeResolverRecognizesDualSenseAndSwitchPro() {
+  func testControllerTypeResolverRecognizesDualSenseSwitchProAndXbox() {
     XCTAssertEqual(
       BridgeControllerProfileType.resolve(
         vendorName: "DualSense Wireless Controller",
@@ -25,6 +25,13 @@ class RunnerTests: XCTestCase {
         vendorName: "Xbox Wireless Controller",
         productCategory: "HID"
       ),
+      .xbox
+    )
+    XCTAssertEqual(
+      BridgeControllerProfileType.resolve(
+        vendorName: "8BitDo Controller",
+        productCategory: "HID"
+      ),
       .generic
     )
   }
@@ -41,6 +48,25 @@ class RunnerTests: XCTestCase {
     XCTAssertEqual(profile.mappings.first { $0.id == "triangle" }?.controlLabel, "X")
     XCTAssertEqual(profile.mappings.first { $0.id == "options" }?.controlLabel, "Minus")
     XCTAssertEqual(profile.mappings.first { $0.id == "menu" }?.controlLabel, "Plus")
+  }
+
+  func testXboxProfileDefaultsUseXboxLabelsAndHideTouchpad() {
+    let profile = BridgeProfile(type: .xbox)
+    let ids = Set(profile.mappings.map(\.id))
+
+    XCTAssertFalse(ids.contains("touchpadMotion"))
+    XCTAssertFalse(ids.contains("touchpad"))
+    XCTAssertEqual(profile.mappings.first { $0.id == "cross" }?.controlLabel, "A")
+    XCTAssertEqual(profile.mappings.first { $0.id == "circle" }?.controlLabel, "B")
+    XCTAssertEqual(profile.mappings.first { $0.id == "square" }?.controlLabel, "X")
+    XCTAssertEqual(profile.mappings.first { $0.id == "triangle" }?.controlLabel, "Y")
+    XCTAssertEqual(profile.mappings.first { $0.id == "l2" }?.controlLabel, "LT")
+    XCTAssertEqual(profile.mappings.first { $0.id == "r2" }?.controlLabel, "RT")
+    XCTAssertEqual(profile.mappings.first { $0.id == "l1" }?.controlLabel, "LB")
+    XCTAssertEqual(profile.mappings.first { $0.id == "r1" }?.controlLabel, "RB")
+    XCTAssertEqual(profile.mappings.first { $0.id == "options" }?.controlLabel, "View")
+    XCTAssertEqual(profile.mappings.first { $0.id == "menu" }?.controlLabel, "Menu")
+    XCTAssertEqual(profile.mappings.first { $0.id == "home" }?.controlLabel, "Xbox")
   }
 
   func testProfileStoreMigratesLegacyGlobalsIntoDualSenseOnly() {
@@ -67,12 +93,15 @@ class RunnerTests: XCTestCase {
 
     let dualSense = store.profile(for: .dualSense)
     let switchPro = store.profile(for: .switchPro)
+    let xbox = store.profile(for: .xbox)
 
     XCTAssertEqual(dualSense.settings.pointerSpeed, 40)
     XCTAssertEqual(dualSense.mappings.first { $0.id == "cross" }?.action, BridgeAction.key)
     XCTAssertEqual(dualSense.mappings.first { $0.id == "cross" }?.keyCode, 36)
     XCTAssertEqual(switchPro.settings.pointerSpeed, BridgeSettings.defaults.pointerSpeed)
     XCTAssertEqual(switchPro.mappings.first { $0.id == "cross" }?.action, BridgeAction.none)
+    XCTAssertEqual(xbox.settings.pointerSpeed, BridgeSettings.defaults.pointerSpeed)
+    XCTAssertEqual(xbox.mappings.first { $0.id == "cross" }?.controlLabel, "A")
   }
 
   func testProfileStoreRoundTripsProfilesIndependently() {

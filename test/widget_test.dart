@@ -214,10 +214,13 @@ void main() {
     expect(find.text('Profiles'), findsOneWidget);
     expect(find.text('DualSense'), findsOneWidget);
     expect(find.text('Switch Pro'), findsOneWidget);
+    expect(find.text('Xbox'), findsOneWidget);
     expect(find.text('Generic'), findsOneWidget);
+    expect(find.byIcon(Icons.sports_esports), findsNWidgets(3));
+    expect(find.byIcon(Icons.gamepad), findsOneWidget);
 
-    await tester.tap(find.text('DualSense'));
-    expect(selectedProfile, 'dualSense');
+    await tester.tap(find.text('Xbox'));
+    expect(selectedProfile, 'xbox');
   });
 
   testWidgets('profile selector uses picker in compact layouts', (
@@ -311,9 +314,46 @@ void main() {
     expect(find.text('X'), findsOneWidget);
     expect(find.text('Touchpad click'), findsNothing);
   });
+
+  testWidgets('xbox profile uses Xbox button labels', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 2600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 900,
+            child: ButtonBindingsPanel(
+              snapshot: xboxProfileSnapshot(),
+              onMappingChanged: (_) {},
+              onReset: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('LT'), findsOneWidget);
+    expect(find.text('RT'), findsOneWidget);
+    expect(find.text('LB'), findsOneWidget);
+    expect(find.text('RB'), findsOneWidget);
+    expect(find.text('A'), findsOneWidget);
+    expect(find.text('B'), findsOneWidget);
+    expect(find.text('X'), findsOneWidget);
+    expect(find.text('Y'), findsOneWidget);
+    expect(find.text('View'), findsOneWidget);
+    expect(find.text('Menu'), findsOneWidget);
+    expect(find.text('Xbox'), findsOneWidget);
+    expect(find.text('Touchpad click'), findsNothing);
+  });
 }
 
-const switchSupportedControlIds = {
+const standardControllerSupportedControlIds = {
   'leftStick',
   'rightStick',
   'l2',
@@ -334,6 +374,9 @@ const switchSupportedControlIds = {
   'options',
   'home',
 };
+
+const switchSupportedControlIds = standardControllerSupportedControlIds;
+const xboxSupportedControlIds = standardControllerSupportedControlIds;
 
 ControllerSnapshot switchProfileSnapshot() {
   return ControllerSnapshot.empty().copyWith(
@@ -413,5 +456,61 @@ ControllerSnapshot switchProfileSnapshot() {
             _ => mapping,
           },
     ],
+  );
+}
+
+ControllerSnapshot xboxProfileSnapshot() {
+  return ControllerSnapshot.empty().copyWith(
+    connected: true,
+    controllerName: 'Xbox Wireless Controller',
+    productCategory: 'HID',
+    controllerType: 'xbox',
+    activeProfileId: 'xbox',
+    activeProfileName: 'Xbox',
+    connectedControllers: const [
+      ConnectedController(
+        id: 'xbox',
+        name: 'Xbox Wireless Controller',
+        productCategory: 'HID',
+        controllerType: 'xbox',
+        profileName: 'Xbox',
+        active: true,
+      ),
+    ],
+    supportedControlIds: xboxSupportedControlIds,
+    mappings: [
+      for (final mapping in defaultMappings)
+        if (xboxSupportedControlIds.contains(mapping.id))
+          switch (mapping.id) {
+            'l2' => xboxMapping(mapping, 'LT'),
+            'r2' => xboxMapping(mapping, 'RT'),
+            'l1' => xboxMapping(mapping, 'LB'),
+            'r1' => xboxMapping(mapping, 'RB'),
+            'cross' => xboxMapping(mapping, 'A'),
+            'circle' => xboxMapping(mapping, 'B'),
+            'square' => xboxMapping(mapping, 'X'),
+            'triangle' => xboxMapping(mapping, 'Y'),
+            'leftStickButton' => xboxMapping(mapping, 'LS'),
+            'rightStickButton' => xboxMapping(mapping, 'RS'),
+            'options' => xboxMapping(mapping, 'View'),
+            'menu' => xboxMapping(mapping, 'Menu'),
+            'home' => xboxMapping(mapping, 'Xbox'),
+            _ => mapping,
+          },
+    ],
+  );
+}
+
+BridgeMapping xboxMapping(BridgeMapping mapping, String controlLabel) {
+  return BridgeMapping(
+    id: mapping.id,
+    controlLabel: controlLabel,
+    action: mapping.action,
+    label: mapping.label,
+    keyCode: mapping.keyCode,
+    keyLabel: mapping.keyLabel,
+    modifiers: mapping.modifiers,
+    vibrate: mapping.vibrate,
+    hapticStyle: mapping.hapticStyle,
   );
 }

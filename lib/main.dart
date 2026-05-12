@@ -129,11 +129,7 @@ class _BridgeSenseHomeState extends State<BridgeSenseHome> {
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  final leftColumn = [
-                    StatusPanel(snapshot: _snapshot),
-                    const SizedBox(height: 14),
-                    TelemetryPanel(snapshot: _snapshot),
-                  ];
+                  final leftColumn = [StatusPanel(snapshot: _snapshot)];
                   final rightColumn = [
                     ProfileSelector(
                       snapshot: _snapshot,
@@ -277,7 +273,7 @@ class ProfileSelector extends StatelessWidget {
       icon: Icons.tune,
       child: LayoutBuilder(
         builder: (context, constraints) {
-          if (constraints.maxWidth < 620) {
+          if (constraints.maxWidth < 560) {
             return DropdownButtonFormField<String>(
               key: ValueKey('profile-picker-$selectedProfileId'),
               initialValue: selectedProfileId,
@@ -410,140 +406,6 @@ class StatusLine extends StatelessWidget {
             style: TextStyle(
               fontWeight: FontWeight.w600,
               color: active ? scheme.primary : scheme.onSurfaceVariant,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class TelemetryPanel extends StatelessWidget {
-  const TelemetryPanel({super.key, required this.snapshot});
-
-  final ControllerSnapshot snapshot;
-
-  @override
-  Widget build(BuildContext context) {
-    final inputs = snapshot.inputs;
-    return SectionCard(
-      title: 'Inputs',
-      icon: Icons.monitor_heart,
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: StickPad(
-                  label: 'L',
-                  x: inputs.value('leftStickX'),
-                  y: inputs.value('leftStickY'),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: StickPad(
-                  label: 'R',
-                  x: inputs.value('rightStickX'),
-                  y: inputs.value('rightStickY'),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 14),
-          AxisBar(label: 'L2', value: inputs.value('l2')),
-          AxisBar(label: 'R2', value: inputs.value('r2')),
-          AxisBar(label: 'Touch X', value: inputs.value('touchpadX')),
-          AxisBar(label: 'Touch Y', value: inputs.value('touchpadY')),
-          AxisBar(label: 'D-pad X', value: inputs.value('dpadX')),
-          AxisBar(label: 'D-pad Y', value: inputs.value('dpadY')),
-        ],
-      ),
-    );
-  }
-}
-
-class StickPad extends StatelessWidget {
-  const StickPad({
-    super.key,
-    required this.label,
-    required this.x,
-    required this.y,
-  });
-
-  final String label;
-  final double x;
-  final double y;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final dotSize = 14.0;
-    return AspectRatio(
-      aspectRatio: 1,
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: scheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: scheme.outlineVariant),
-        ),
-        child: Stack(
-          children: [
-            Center(child: Container(height: 1, color: scheme.outlineVariant)),
-            Center(child: Container(width: 1, color: scheme.outlineVariant)),
-            Center(
-              child: Text(
-                label,
-                style: TextStyle(
-                  color: scheme.onSurfaceVariant,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-            Align(
-              alignment: Alignment(
-                x.clamp(-1, 1).toDouble(),
-                (-y).clamp(-1, 1).toDouble(),
-              ),
-              child: Container(
-                width: dotSize,
-                height: dotSize,
-                decoration: BoxDecoration(
-                  color: scheme.primary,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: scheme.surface, width: 2),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class AxisBar extends StatelessWidget {
-  const AxisBar({super.key, required this.label, required this.value});
-
-  final String label;
-  final double value;
-
-  @override
-  Widget build(BuildContext context) {
-    final normalized = ((value + 1) / 2).clamp(0.0, 1.0);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        children: [
-          SizedBox(width: 68, child: Text(label)),
-          Expanded(child: LinearProgressIndicator(value: normalized)),
-          const SizedBox(width: 10),
-          SizedBox(
-            width: 46,
-            child: Text(
-              value.toStringAsFixed(2),
-              textAlign: TextAlign.right,
-              style: const TextStyle(fontFeatures: []),
             ),
           ),
         ],
@@ -1518,9 +1380,14 @@ const controllerProfileOptions = [
   ControllerProfileOption(
     id: 'switchPro',
     name: 'Switch Pro',
-    icon: Icons.gamepad,
+    icon: Icons.sports_esports,
   ),
-  ControllerProfileOption(id: 'generic', name: 'Generic', icon: Icons.tune),
+  ControllerProfileOption(
+    id: 'xbox',
+    name: 'Xbox',
+    icon: Icons.sports_esports,
+  ),
+  ControllerProfileOption(id: 'generic', name: 'Generic', icon: Icons.gamepad),
 ];
 
 class BridgeSettings {
@@ -1753,6 +1620,7 @@ String controllerTypeLabel(String type) {
   return switch (type) {
     'dualSense' => 'DualSense',
     'switchPro' => 'Switch Pro',
+    'xbox' => 'Xbox',
     'generic' => 'Generic',
     _ => 'None',
   };

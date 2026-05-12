@@ -2071,6 +2071,7 @@ enum MouseButton: String {
 enum BridgeControllerProfileType: String, CaseIterable {
   case dualSense
   case switchPro
+  case xbox
   case generic
 
   var displayName: String {
@@ -2079,6 +2080,8 @@ enum BridgeControllerProfileType: String, CaseIterable {
       return "DualSense"
     case .switchPro:
       return "Switch Pro"
+    case .xbox:
+      return "Xbox"
     case .generic:
       return "Generic"
     }
@@ -2110,7 +2113,7 @@ enum BridgeControllerProfileType: String, CaseIterable {
         "home",
         "touchpad",
       ]
-    case .switchPro, .generic:
+    case .switchPro, .xbox, .generic:
       return [
         "leftStick",
         "rightStick",
@@ -2153,6 +2156,22 @@ enum BridgeControllerProfileType: String, CaseIterable {
         "options": "Minus",
         "home": "Home",
       ]
+    case .xbox:
+      return [
+        "l2": "LT",
+        "r2": "RT",
+        "l1": "LB",
+        "r1": "RB",
+        "cross": "A",
+        "circle": "B",
+        "square": "X",
+        "triangle": "Y",
+        "leftStickButton": "LS",
+        "rightStickButton": "RS",
+        "menu": "Menu",
+        "options": "View",
+        "home": "Xbox",
+      ]
     case .generic:
       return [
         "cross": "Button A",
@@ -2186,6 +2205,11 @@ enum BridgeControllerProfileType: String, CaseIterable {
       || normalized.contains("switch")
       || normalized.contains("procontroller") {
       return .switchPro
+    }
+    if normalized.contains("xbox")
+      || normalized.contains("microsoft")
+      || normalized.contains("xinput") {
+      return .xbox
     }
     return .generic
   }
